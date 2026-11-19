@@ -1,0 +1,41 @@
+{
+  "workspace": "",
+  "llama_dir": "",
+  "server_exe": "",
+  "model_dir": "",
+  "llama_repo": "https://github.com/ggml-org/llama.cpp.git",
+  "llama_ref": "",
+  "build_jobs": 8,
+  "cuda_arch": "90",
+  "model_profiles": {
+    "inkling2": {
+      "label": "Inkling 2 Small (594B / 17B active)",
+      "repo": "unsloth/Inkling-2-Small-GGUF",
+      "revision": "main",
+      "max_context": 1048576,
+      "layers": 48,
+      "full_layers": 8,
+      "sliding_layers": 40,
+      "window": 1024,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "expert_fraction_estimate": 0.92,
+      "projector": "mmproj-F16.gguf",
+      "reasoning_template": true,
+      "quants": {
+        "UD-IQ1_S": {"gb": 171.7, "agreement": 89.7, "pattern": "UD-IQ1_S/*"},
+        "UD-IQ1_M": {"gb": 178.5, "agreement": 90.2, "pattern": "UD-IQ1_M/*"},
+        "UD-IQ2_XXS": {"gb": 190.6, "agreement": 91.8, "pattern": "UD-IQ2_XXS/*"},
+        "UD-Q2_K_XL": {"gb": 205.0, "agreement": 92.7, "pattern": "UD-Q2_K_XL/*"},
+        "UD-IQ3_XXS": {"gb": 226.0, "agreement": 93.3, "pattern": "UD-IQ3_XXS/*"},
+        "UD-Q3_K_XL": {"gb": 285.1, "agreement": 95.3, "pattern": "UD-Q3_K_XL/*"},
+        "UD-Q4_K_XL": {"gb": 354.2, "agreement": 98.0, "pattern": "UD-Q4_K_XL/*"},
+        "UD-Q8_K_XL": {"gb": 386.5, "agreement": 98.1, "pattern": "UD-Q8_K_XL/*"},
+        "BF16": {"gb": 484.4, "agreement": 100.0, "pattern": "BF16/*"}
+      }
+    }
+  },
+  "defaults": {
+    "profile": "inkling2", "quant": "UD-IQ2_XXS", "mode": "hybrid", "kv_location": "gpu", "kv_type": "f16", "context": 32768, "pool": 32768, "parallel": 1, "cpu_layers": 8, "expert_cache": 0, "cpu_share": 0, "ram_cache": 0, "runtime_reserve": 12, "ram_reserve": 24, "batch": 512, "ubatch": 128, "threads": 12, "gpu_ids": "", "split": "", "host": "127.0.0.1", "port": 8080, "alias": "inkling-2-small", "reasoning": "high", "auth": false, "vision": false, "unified": false, "model_path": ""
+  }
+}
