@@ -1,6 +1,6 @@
 """Local-only Windows llama.cpp manager. Python 3.12, standard library UI."""
 from __future__ import annotations
-import ctypes, fnmatch, hashlib, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, urllib.error, webbrowser, zipfile
+import ctypes, fnmatch, hashlib, json, os, re, secrets, shutil, socket, struct, subprocess, sys, tempfile, threading, time, traceback, urllib.request, urllib.error, webbrowser, zipfile
 from collections import deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -291,6 +291,62 @@ def check_shards(f):
     return fs
 
 
+def gguf_metadata(path):
+    """Read bounded GGUF metadata without loading tensor data or rewriting files."""
+    sizes={0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+    formats={0:'B',1:'b',2:'H',3:'h',4:'I',5:'i',6:'f',7:'?',10:'Q',11:'q',12:'d'}
+    end=min(path.stat().st_size,512*1024**2)
+    with path.open('rb') as f:
+        def read(n):
+            if n<0 or f.tell()+n>end:raise ValueError('GGUF metadata 범위가 잘못되었거나 검사 한도를 초과했습니다.')
+            data=f.read(n)
+            if len(data)!=n:raise ValueError('GGUF metadata EOF')
+            return data
+        def skip(n):
+            if n<0 or f.tell()+n>end:raise ValueError('GGUF metadata 범위 오류')
+            f.seek(n,1)
+        def uint(fmt):return struct.unpack('<'+fmt,read(struct.calcsize('<'+fmt)))[0]
+        def string(keep):
+            n=uint('Q')
+            if keep:
+                if n>1048576:raise ValueError('GGUF metadata 문자열 검사 한도 초과')
+                return read(n).decode('utf-8','replace')
+            skip(n)
+        if read(4)!=b'GGUF':raise ValueError('GGUF header 오류')
+        version=uint('I')
+        if version not in (2,3):raise ValueError('지원하지 않는 GGUF metadata 버전: '+str(version))
+        tensors,count=uint('Q'),uint('Q')
+        if count>100000:raise ValueError('GGUF metadata 키 검사 한도 초과')
+        out={}
+        for _ in range(count):
+            key=string(True);typ=uint('I')
+            keep=key in ('general.architecture','general.name','general.file_type','split.no','split.count','split.tensors.count') or key.startswith(('inkling2.attention.','inkling2.block_count','inkling2.context_length','clip.projector_type'))
+            if typ in sizes:
+                if keep:out[key]=uint(formats[typ])
+                else:skip(sizes[typ])
+            elif typ==8:
+                val=string(keep)
+                if keep:out[key]=val
+            elif typ==9:
+                item,n=uint('I'),uint('Q')
+                if n>10000000:raise ValueError('GGUF metadata 배열 검사 한도 초과')
+                if item in sizes:skip(n*sizes[item])
+                elif item==8:
+                    for __ in range(n):string(False)
+                else:raise ValueError('지원하지 않는 GGUF 배열 타입')
+                if keep:out[key]='array('+str(n)+')'
+            else:raise ValueError('지원하지 않는 GGUF 타입: '+str(typ))
+        return {'version':version,'tensor_count':tensors,'metadata':out}
+
+def inspect_local_model(raw):
+    f=resolve_model(raw);files=check_shards(f); result=gguf_metadata(f)
+    md=result['metadata'];notes=[]
+    arch=md.get('general.architecture')
+    if raw.get('profile')=='inkling2' and arch!='inkling2':notes.append('선택한 Inkling 2 모델과 GGUF architecture가 다릅니다. mmproj 또는 다른 모델 파일인지 확인하세요.')
+    if arch=='inkling2' and 'inkling2.attention.relative_length' not in md:notes.append('relative_length 없음: 기존 GGUF와 최신 엔진의 스키마 차이일 수 있습니다. 현재 체크아웃 호환 엔진으로 시험하세요. 값을 임의로 추가하지 않습니다.')
+    if md.get('split.count') is not None and md['split.count']!=len(files):notes.append('GGUF split.count와 실제 분할 파일 수가 다릅니다.')
+    return {**result,'path':str(f),'shards':len(files),'gib':sum(x.stat().st_size for x in files)/GIB,'notes':notes}
+
 def num(d,k,lo,hi,integer=True):
     v=float(d[k]);
     if not lo<=v<=hi or (integer and v!=int(v)):raise ValueError(f'{k}: {lo}~{hi} 범위 필요')
@@ -494,12 +550,42 @@ def command_preview(raw):
         if '--no-mmproj' in args and '--mmproj' in args:
             raise ValueError('Vision 체크를 해제하거나 --mmproj를 제거하세요.')
         e['danger'].append('복구 옵션 적용 중: 메모리 예상값과 GUI 설정이 최종 명령과 다를 수 있습니다. 실제 명령과 메모리를 확인하세요.')
+    if exe and exe.is_file():
+        env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
+        h=engine_help(str(exe),env)
+        args,notes=compatible_args(d,args,h);e['warnings'].extend(notes)
+        missing=[a for a in args[1:] if a.startswith('--') and not help_has(h,a)]
+        if missing:e['warnings'].append('필수/명시 옵션 미지원 (실행 전 해결 필요): '+', '.join(missing))
     return d,e,args
 
 
-def supports(exe,args,env=None):
+def engine_help(exe,env=None):
     rc,h=run_capture([exe,'--help'],30,env=env)
     if rc!=0:raise ValueError('llama-server --help 실패: '+h[-600:])
+    return h
+
+def help_has(h,flag):
+    return bool(re.search(r'(?<![\\w-])'+re.escape(flag)+r'(?![\\w-])',h))
+
+def compatible_args(d,args,h):
+    """Only remove unsupported optional/default features; never change model placement or security."""
+    args=list(args);notes=[]
+    optional={'--metrics':0,'--cont-batching':0,'--no-mmproj':0}
+    if not d['unified']:optional['--no-kv-unified']=0
+    if not d['ram_cache']:optional['--cache-ram']=1
+    # Older builds have no fit switch; absence is not the same as explicit auto-fit.
+    optional['--fit']=1
+    if d['kv_type']=='f16':
+        optional.update({'--cache-type-k':1,'--cache-type-v':1})
+    if d.get('reasoning')=='high':optional['--chat-template-kwargs']=1
+    explicit=recovery_options(d)
+    for flag,n in optional.items():
+        if flag in args and flag not in explicit and not help_has(h,flag):
+            i=args.index(flag);del args[i:i+1+n];notes.append('미지원 부가 옵션 생략: '+flag)
+    return args,notes
+
+def supports(exe,args,env=None):
+    h=engine_help(exe,env)
     missing=[]
     for a in args[1:]:
         if a.startswith('--') and not re.search(r'(?<![\w-])'+re.escape(a)+r'(?![\w-])',h):missing.append(a)
@@ -971,7 +1057,7 @@ HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name
 <section id="env" class="tab"><div class="cols"><div class="panel"><h2>환경 진단</h2><p>먼저 GPU와 필수 도구를 확인하세요. 설치 직후 PATH가 갱신되지 않았다면 이 도구를 다시 실행하세요.</p><div class="buttons"><button class="primary" onclick="diagnose()">환경 다시 검사</button><button onclick="act('install_hf',{})">HF 다운로드 도구 설치</button></div><div id="diagnosis"></div></div><div class="panel"><h2>저장 경로</h2><p>기존 AI 폴더 또는 여유 공간이 큰 고정 디스크를 탐색합니다. 필요하면 직접 수정하세요.</p><div id="pathFields"></div><div class="buttons"><button onclick="save()">경로/세팅 저장</button></div><p>모델, 빌드 결과는 작업 폴더에 저장합니다. 개인 설정과 API 키는 사용자 전용 데이터 폴더에 저장합니다.</p></div></div></section>
 <section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><p>다운로드 선택은 서버 설정과 독립적입니다. 실행 중인 동일 파일은 보호됩니다.</p><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect',downloadForm())">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
 <section id="build" class="tab hidden"><div class="cols"><div class="panel"><h2>llama.cpp 엔진 관리 · CUDA 빌드</h2><p>이미 체크아웃한 호환 브랜치가 있다면 아래 버튼을 사용하세요. 기존 소스를 업데이트하지 않습니다.</p><div class="buttons"><button onclick="scanEngines()">소스 및 실행 파일 검색</button><button class="primary" onclick="buildCurrent()">현재 체크아웃 그대로 빌드</button></div><div id="engineList"></div><details><summary>일반 빌드 / 공식 바이너리 설치</summary><p>기존 소스를 재사용하고 없다면 공식 Git 저장소에서 clone합니다. Visual Studio C++ 빌드 도구와 CUDA Toolkit이 필요합니다.</p><div id="buildFields"></div><h3>공식 사전 컴파일 바이너리 (컴파일 대안)</h3><div id="runtimeFields"></div><div class="buttons"><button onclick="installBinary()">공식 CUDA 바이너리 설치</button><button onclick="useInstalled()">설치/빌드 결과 실행 파일 적용</button></div><p>GitHub 공식 릴리스만 사용합니다. CUDA 12/13은 드라이버와 호환되는 버전을 선택하세요.</p><label class="check"><input type="checkbox" id="fresh_build">새 빌드 폴더 사용 (기존 파일 유지)</label><label class="check"><input type="checkbox" id="update_source">기존 소스 업데이트 (변경사항이 없을 때만)</label><div class="buttons"><button class="primary" onclick="act('build')">컴파일 시작</button><button onclick="stop('build')">중지</button></div><p>H100은 CUDA arch 90. Git ref를 지정하면 해당 버전으로 빌드합니다. 최초 빌드는 오래 걸릴 수 있습니다.</p></details></div><div class="panel"><h2>빌드 로그</h2><pre id="buildLog"></pre><p>오류 시 마지막 로그와 환경 진단을 확인하세요. 기존 CMake 생성기와 충돌한다면 소스를 보존하고 build 폴더만 이름을 변경한 후 다시 빌드하세요.</p></div></div></section>
-<section id="run" class="tab hidden"><div class="cols"><div class="panel"><h2>추론 서버 설정</h2><div id="runModel"></div><div id="wizard"></div><details id="advancedDetails"><summary style="cursor:pointer;padding:12px 0;font-weight:650">고급 설정 · 모든 숫자 직접 변경</summary><div class="buttons"><button onclick="preset('safe')">첫 구동 (2 GPU)</button><button onclick="preset('long')">1M / GPU KV</button><button onclick="preset('host')">1M / RAM KV</button><button onclick="preset('team')">15인 공유 KV</button><button onclick="preset('q4long')">Q4 1M / 2 GPU</button></div><p>프리셋은 출발점일 뿐이며 GPU 장수와 선택 모델에 따라 조정하세요. 먼저 예상치를 계산하세요.</p><h3>모델 · 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진 · 네트워크</h3><div class="grid" id="advanced"></div><h3>오류 복구 옵션 (고급)</h3><p>실행 명령에 옵션을 추가/제거/변경합니다. 예: --flash-attn off 또는 --no-mmap. null은 제거, true는 스위치 추가입니다. 일반 설정에서 바꿀 수 있는 값은 그곳에서 변경하세요.</p><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--flash-attn":"off","--no-warmup":true,"--no-kv-unified":null}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="preset('rescue')">8K 안전 구동</button></div></details><div class="buttons"><button onclick="save()">세팅 저장</button><button onclick="preview()">예상 자원 / 명령어</button><button onclick="plan()">자동 메모리 배치 추천</button><button class="primary" onclick="startServer()">서버 시작</button><button onclick="stop('server')">서버 중지</button></div></div><div><div class="panel"><h2>실행 전 메모리 예측</h2><div id="estimate"><p>설정을 선택한 후 예상 자원을 계산하세요.</p></div><p>GiB 단위. 실제 llama.cpp가 할당하는 메모리는 다를 수 있습니다.</p><h3>자동 배치 후보</h3><div id="plans"><p>선택한 모델/컨텍스트를 유지한 채 후보를 계산합니다.</p></div><h3>생성 명령어</h3><pre id="command"></pre></div><div class="panel"><h2>접속</h2><div id="connection"></div><p>로컬 브라우저에서 먼저 테스트한 후 사내 IP를 사용하세요. Claude Code 확장은 Anthropic Messages API 호환 여부를 별도 확인하세요.</p></div></div></div></section>
+<section id="run" class="tab hidden"><div class="cols"><div class="panel"><h2>추론 서버 설정</h2><div id="runModel"></div><div id="wizard"></div><div class="buttons"><button onclick="inspectLocal()">로컬 GGUF 호환성 검사</button></div><pre id="localModelInspection">모델 파일을 변경하지 않는 검사입니다.</pre><details id="advancedDetails"><summary style="cursor:pointer;padding:12px 0;font-weight:650">고급 설정 · 모든 숫자 직접 변경</summary><div class="buttons"><button onclick="preset('safe')">첫 구동 (2 GPU)</button><button onclick="preset('long')">1M / GPU KV</button><button onclick="preset('host')">1M / RAM KV</button><button onclick="preset('team')">15인 공유 KV</button><button onclick="preset('q4long')">Q4 1M / 2 GPU</button></div><p>프리셋은 출발점일 뿐이며 GPU 장수와 선택 모델에 따라 조정하세요. 먼저 예상치를 계산하세요.</p><h3>모델 · 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진 · 네트워크</h3><div class="grid" id="advanced"></div><h3>오류 복구 옵션 (고급)</h3><p>실행 명령에 옵션을 추가/제거/변경합니다. 예: --flash-attn off 또는 --no-mmap. null은 제거, true는 스위치 추가입니다. 일반 설정에서 바꿀 수 있는 값은 그곳에서 변경하세요.</p><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--flash-attn":"off","--no-warmup":true,"--no-kv-unified":null}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="preset('rescue')">8K 안전 구동</button></div></details><div class="buttons"><button onclick="save()">세팅 저장</button><button onclick="preview()">예상 자원 / 명령어</button><button onclick="plan()">자동 메모리 배치 추천</button><button class="primary" onclick="startServer()">서버 시작</button><button onclick="stop('server')">서버 중지</button></div></div><div><div class="panel"><h2>실행 전 메모리 예측</h2><div id="estimate"><p>설정을 선택한 후 예상 자원을 계산하세요.</p></div><p>GiB 단위. 실제 llama.cpp가 할당하는 메모리는 다를 수 있습니다.</p><h3>자동 배치 후보</h3><div id="plans"><p>선택한 모델/컨텍스트를 유지한 채 후보를 계산합니다.</p></div><h3>생성 명령어</h3><pre id="command"></pre></div><div class="panel"><h2>접속</h2><div id="connection"></div><p>로컬 브라우저에서 먼저 테스트한 후 사내 IP를 사용하세요. Claude Code 확장은 Anthropic Messages API 호환 여부를 별도 확인하세요.</p></div></div></div></section>
 <section id="monitor" class="tab hidden"><div class="panel"><h2>실시간 GPU · 서버 상태</h2><div id="gpuCards" class="grid"></div><div id="taskCards" class="grid"></div><div class="buttons"><button onclick="stop('server')">관리 중인 서버 중지</button><button onclick="poll()">즉시 갱신</button></div><div id="health"></div></div><div class="cols"><div class="panel"><h2>서버 로그 (최근 900줄)</h2><h3>최근 실행 요청 오류</h3><pre id="actionError">—</pre><h3>실패 로그 핵심 (자동 추출)</h3><pre id="serverErrors">—</pre><h3>로컬 진단 명령</h3><p>서버 외부로 전송하지 않습니다. 허용된 진단 명령만 실행합니다.</p><input id="diagCommand" list="diagList" value="llama-server --version"><datalist id="diagList"><option value="llama-server --version"><option value="llama-server --help"><option value="llama-server --list-devices"><option value="nvidia-smi"><option value="nvidia-smi -q"><option value="nvcc --version"></datalist><div class="buttons"><button onclick="runDiagnostic()">진단 실행</button></div><pre id="diagOutput"></pre><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><pre id="serverLog" style="max-height:560px"></pre></div><div class="panel"><h2>API /metrics · /slots</h2><div id="rates" class="grid"></div><pre id="metrics"></pre><pre id="slots"></pre></div></div></section>
 <section id="tuning" class="tab hidden"><div class="panel"><h2>실측 벤치마크 · 자동 튜닝</h2><p>합성 토큰만 사용합니다. 단일 슬롯에서 테스트하세요. 자동 튜닝은 서버를 중지한 상태에서 여러 후보를 직접 로딩하고 실패 시 다음 후보로 이동합니다. 1M 설정은 매우 오래 걸릴 수 있습니다. 입력 길이를 짧게 시작하세요.</p><div class="grid"><label class="field"><span>입력 토큰 수</span><input type="number" id="bench_prompt" value="512" min="32" max="1048576"></label><label class="field"><span>생성 토큰 수</span><input type="number" id="bench_output" value="128" min="16" max="1024"></label></div><div class="buttons"><button onclick="runBench(false)">실행 중 서버 벤치마크</button><button class="primary" onclick="runBench(true)">자동 튜닝 (서버 중지 후)</button><button onclick="stop('tune')">튜닝 중지</button><button onclick="applyBest()">가장 빠른 실측 후보 적용</button></div><div id="tuneBest"></div><h3>최근 측정 (최대 10개)</h3><div id="history"></div><h3>벤치마크 로그</h3><pre id="benchmarkLog"></pre><h3>튜닝 로그</h3><pre id="tuneLog"></pre></div></section><section id="auth" class="tab hidden"><div class="panel"><h2>API 접근 키</h2><p>기본값은 인증 없음 + localhost. 사내 네트워크에서 서비스할 때만 승인된 범위에 노출하고 API 키 사용을 권장합니다. 키 활성화는 실행 설정에서 별도로 선택하세요. 키 추가/회수 후 재시작이 필요합니다.</p><div class="buttons"><button class="primary" onclick="key('add')">새 API 키 생성</button></div><div id="newKey"></div><div id="keyList"></div><p>키는 사용자 전용 디렉터리의 api-keys.txt에 저장되며 Git에 포함되지 않습니다. 사용자별 요청량 할당/회계는 제공하지 않습니다.</p></div></section></main><div id="toast" role="status"></div>
 <script>
@@ -1021,6 +1107,7 @@ async function diagnose(){await guard(async()=>{let r=await api('diagnose',form)
 function metric(k,v,h=''){return `<div class="metric"><small>${esc(k)}</small><b>${esc(v)}</b><small>${esc(h)}</small></div>`}
 async function preview(){return guard(async()=>{let r=await api('preview',form),e=r.estimate;$('estimate').innerHTML=`<div class="grid">${metric('예상 VRAM',fmt(e.gpu)+' GiB','여유 '+fmt(e.vfree))}${metric('예상 RAM 예산',fmt(e.host_ram)+' GiB','여유 '+fmt(e.ram_free))}${metric('GPU 상주 가중치',fmt(e.gpu_weight)+' GiB','CPU '+fmt(e.cpu_weight))}${metric('활성 KV',fmt(e.kv)+' GiB','SWA 미절약 시 '+fmt(e.kv_worst))}${metric('KV pool',e.pool.toLocaleString(),'tokens')}${metric('전체 가중치',fmt(e.weight)+' GiB','디스크 여유 '+fmt(e.archive_free))}</div><p>GPU별 추정: ${e.gpu_allocation.map((x,i)=>`GPU ${e.gpu_ids[i]}: ${fmt(x)} GiB`).join(' / ')||'—'}</p><p>모델: ${esc(e.model||'아직 다운로드 안 됨 / 경로 미지정')}</p>${e.danger.map(x=>`<p class="bad">⚠ ${esc(x)}</p>`).join('')}${e.warnings.map(x=>`<p class="warn">• ${esc(x)}</p>`).join('')}`;$('command').textContent=r.command;return r})}
 async function installBinary(){if(confirm('공식 llama.cpp GitHub 릴리스의 Windows CUDA 실행 파일 및 DLL을 다운로드하고 실행 파일 버전을 확인할까요? GPU 드라이버 호환성은 별도 확인이 필요합니다.'))await act('install_binary')}
+async function inspectLocal(){await guard(async()=>{let r=await api('inspect_local_model',form);$('localModelInspection').textContent=JSON.stringify(r,null,2)})}
 let engineRows=[];
 async function scanEngines(){await guard(async()=>{let r=await api('engines',form);engineRows=r.engines;$('engineList').innerHTML='<p>소스: '+esc(r.source.path)+'<br>Git: '+esc(r.source.branch)+' / '+esc(r.source.head||'미확인')+(r.source.dirty?' (수정됨)':'')+'</p><p>선택 중: '+esc(r.selected||'없음')+'</p>'+engineRows.map((x,i)=>'<div class="metric"><small>'+esc(x.path)+'</small><p>'+esc(x.commit||'빌드 커밋 미확인')+(x.matches?' · 현재 소스와 일치':'')+'</p><button onclick="selectEngine('+i+')">이 엔진 사용</button></div>').join('')})}
 async function selectEngine(i){if(!engineRows[i])return;form.server_exe=engineRows[i].path;render();await save();await scanEngines()}
@@ -1083,6 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
             elif action=='build':build(d)
             elif action=='build_current':build_current(d)
             elif action=='engines':result=engine_inventory(d)
+            elif action=='inspect_local_model':result=inspect_local_model(d)
             elif action=='install_binary':install_binary(d)
             elif action=='plan':result=placement_plan(d)
             elif action=='recommend':result=recommend_setup(d)
