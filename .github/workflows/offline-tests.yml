@@ -1,0 +1,26 @@
+name: Offline checks
+on:
+  pull_request:
+  push:
+    branches: [v0.5-speed-studio]
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m py_compile manager.py speed.py
+      - run: python -m unittest discover -s tests -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node -e "const h=require('fs').readFileSync('ui.html','utf8');new Function(h.split('<script>')[1].split('</script>')[0].replace('__TOKEN__','null'));console.log('UI syntax OK')"
