@@ -1149,13 +1149,13 @@ def bench_counts(raw,ctx):
     return prompt,out
 
 
-def measure_server(port,prompt_tokens,out_tokens,auth=False,seed=123):
+def measure_server(port,prompt_tokens,out_tokens,auth=False,seed=123,timeout=14400):
     # Synthetic sample only; exact prompt token count from server tokenizer.
     sample='The robot recorded the experiment, analyzed the error, and described the next step.\n'
     ids=api_json(port,'/tokenize',{'content':sample,'add_special':False},auth,30).get('tokens',[])
     if not ids or not all(isinstance(x,int) for x in ids):raise RuntimeError('서버 tokenizer 응답이 올바르지 않습니다.')
     prompt=(ids*((prompt_tokens+len(ids)-1)//len(ids)))[:prompt_tokens]
-    begin=time.monotonic();response=api_json(port,'/completion',{'prompt':prompt,'n_predict':out_tokens,'ignore_eos':True,'cache_prompt':False,'temperature':0.0,'seed':seed,'stream':False},auth,14400)
+    begin=time.monotonic();response=api_json(port,'/completion',{'prompt':prompt,'n_predict':out_tokens,'ignore_eos':True,'cache_prompt':False,'temperature':0.0,'seed':seed,'stream':False},auth,timeout)
     t=response.get('timings',{});result={k:t[k] for k in ('prompt_n','prompt_ms','prompt_per_second','predicted_n','predicted_ms','predicted_per_second') if isinstance(t.get(k),(int,float))}
     if result.get('predicted_n',0)<=0 or result.get('predicted_per_second',0)<=0:raise RuntimeError('서버가 생성 timing 데이터를 반환하지 않았습니다.')
     result['wall_seconds']=round(time.monotonic()-begin,3);result['requested_prompt']=prompt_tokens;result['requested_output']=out_tokens
@@ -1217,7 +1217,7 @@ def tune(raw):
     goal=bool(raw.get('goal_tune'))
     if recovery_options(d):raise ValueError('자동 튜닝 전에 복구 옵션을 비워 주세요.')
     if not goal and (d['parallel']!=1 or d['unified']):raise ValueError('자동 튜닝은 단일 슬롯/비공유 KV 전용입니다.')
-    if d['mode']!='hybrid' and not raw.get('allow_gpu_tune') and not raw.get('goal_tune'):raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
+    if d['mode']!='hybrid' and not raw.get('allow_gpu_tune') and not goal:raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
     exe=find_server(d)
     if not exe:raise ValueError('llama-server 실행 파일이 필요합니다.')
     if not goal:check_shards(resolve_model(d))
@@ -1287,9 +1287,9 @@ def tune(raw):
                     except (OSError,ValueError):pass
                     time.sleep(2)
                 trial_n=min(n,trial['context']-m-32)
-                first=measure_server(trial['port'],trial_n,m)
+                first=measure_server(trial['port'],trial_n,m,timeout=300 if goal else 14400)
                 if TASKS['tune']['cancel']:break
-                second=measure_server(trial['port'],trial_n,m,seed=124)
+                second=measure_server(trial['port'],trial_n,m,seed=124,timeout=300 if goal else 14400)
                 packed={**second,'cold_decode_tps':first['predicted_per_second']}
                 item=record_bench('tune',trial,packed);results.append(item)
                 if goal:
@@ -1306,7 +1306,7 @@ def tune(raw):
                 set_task_meta('tune',results=results,best=best)
                 log('tune',f"측정 완료 | cold {first['predicted_per_second']:.2f} / warm {second['predicted_per_second']:.2f} t/s")
             except Exception as exc:
-                log('tune','후보 실패 (다음 안전 후보로 이동): '+str(exc))
+                log('tune','후보 실패 (다음 후보로 이동): '+str(exc))
             finally:
                 if proc and proc.poll() is None:
                     proc.terminate()
