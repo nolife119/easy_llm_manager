@@ -125,6 +125,14 @@ def build_hint(message):
         return 'VRAM/RAM 할당 실패: 컨텍스트, ubatch, Expert cache를 줄이거나 CPU MoE 층을 늘린 뒤 예상치를 확인하세요.'
     if any(t in x for t in ('unknown argument','unknown model architecture','unsupported model architecture')):
         return '모델 아키텍처 또는 옵션을 지원하는 최신 llama.cpp 빌드인지 확인하세요.'
+    if any(t in x for t in ('no kernel image','invalid device function','not compiled with cuda','cuda driver version is insufficient','cublas_status_arch_mismatch')):
+        return 'CUDA 커널/드라이버 호환성을 확인하세요. 실행 파일 버전과 nvidia-smi 확인, H100 arch 90 빌드 또는 호환 공식 바이너리 권장.'
+    if any(t in x for t in ('invalid magic','unexpected end of file','failed to read','tensor data is not within','missing tensor','failed to open gguf','invalid gguf')):
+        return 'GGUF 파일/분할 shard 또는 모델 변환 호환성 확인. 다운로드 완료 여부, 첫 shard, 최신 엔진을 확인하세요.'
+    if any(t in x for t in ('flash attention','flash_attn','ggml_assert','assertion failed')):
+        return 'Attention/커널 관련 오류일 수 있습니다. 8K/F16 KV/Expert 캐시 0으로 먼저 테스트하고 정확한 에러 줄을 확인하세요.'
+    if any(t in x for t in ('paging file','page file','1455','bad_alloc','not enough memory')):
+        return 'Windows RAM/커밋 한도 또는 페이지 파일 부족 가능성. 여유 RAM 및 페이지 파일 설정을 확인하세요.'
     return ''
 
 def vs_install():
@@ -348,6 +356,48 @@ def placement_plan(raw):
             candidates.append(candidate);break
     return {'candidates':candidates,'message':'추정 예산을 만족하는 후보입니다. 실측 전 속도 순위나 로딩 성공을 보장하지 않습니다.' if candidates else '현재 모델/컨텍스트에는 여유 예산을 만족하는 후보가 없습니다. KV 정밀도, 컨텍스트, RAM 캐시, 양자화 선택을 확인하세요.'}
 
+# Recovery options are argv entries, not shell commands. Paths, network and auth stay managed.
+RECOVERY_VALUE = {'--flash-attn': {'on','off','auto'}, '--fit': {'on','off'},
+                  '--cache-type-k': {'f16','q8_0','q4_0'}, '--cache-type-v': {'f16','q8_0','q4_0'}}
+RECOVERY_SWITCH = {'--no-mmap','--mmap','--no-warmup','--warmup','--no-kv-unified','--kv-unified',
+                   '--no-kv-offload','--no-cont-batching','--cont-batching','--jinja','--metrics',
+                   '--cache-idle-slots','--swa-full','--no-op-offload','--no-repack'}
+RECOVERY_REMOVE_VALUE = {'--cache-ram','--kv-unified-per-slot','--chat-template-kwargs','--moe-cache-mib','--moe-cache-cpu-share','--n-cpu-moe'}
+RECOVERY_PAIRS = {'--no-mmap':'--mmap','--mmap':'--no-mmap','--no-warmup':'--warmup','--warmup':'--no-warmup',
+                  '--no-kv-unified':'--kv-unified','--kv-unified':'--no-kv-unified',
+                  '--no-cont-batching':'--cont-batching','--cont-batching':'--no-cont-batching'}
+
+def recovery_options(raw):
+    value=raw.get('recovery_options','')
+    if not isinstance(value,str) or len(value)>4096:raise ValueError('복구 옵션은 4096자 이하 JSON 텍스트여야 합니다.')
+    try: opts=json.loads(value) if value.strip() else {}
+    except ValueError as exc:raise ValueError('복구 옵션 JSON 오류: '+str(exc)) from exc
+    if not isinstance(opts,dict):raise ValueError('복구 옵션은 JSON 객체여야 합니다.')
+    for k,v in opts.items():
+        if k in RECOVERY_VALUE:
+            if v is not None and (not isinstance(v,str) or v not in RECOVERY_VALUE[k]):raise ValueError('지원하지 않는 복구 값: '+k)
+        elif k in RECOVERY_SWITCH:
+            if v is not None and v is not True:raise ValueError('스위치 값은 true 또는 null: '+k)
+        elif k in RECOVERY_REMOVE_VALUE:
+            if v is not None:raise ValueError('이 옵션은 제거(null)만 가능. 값은 일반 설정으로 변경하세요: '+k)
+        else:raise ValueError('지원하지 않는 복구 옵션: '+str(k))
+    if any(opts.get(k) is True and opts.get(v) is True for k,v in RECOVERY_PAIRS.items()):raise ValueError('서로 반대되는 스위치가 동시에 설정되었습니다.')
+    return opts
+
+def apply_recovery(args,opts):
+    args=list(args)
+    def remove(k):
+        while k in args[1:]:
+            i=args.index(k,1);count=2 if k in RECOVERY_VALUE or k in RECOVERY_REMOVE_VALUE else 1
+            del args[i:i+count]
+    for k,v in opts.items():
+        remove(k)
+        if v is not None:
+            if k in RECOVERY_PAIRS:remove(RECOVERY_PAIRS[k])
+            args.append(k)
+            if v is not True:args.append(v)
+    return args
+
 def command_preview(raw):
     d,p,q=validate(raw); e=estimate(d); exe=find_server(d); f=resolve_model(d)
     args=[str(exe or 'llama-server.exe'),'-m',str(f or '<GGUF first shard>'),'--alias',str(d['alias']),'-ngl','99','--split-mode','layer','-c',str(d['pool']),'-np',str(d['parallel']),'-b',str(d['batch']),'-ub',str(d['ubatch']),'-t',str(d['threads']),'--host',d['host'],'--port',str(d['port']),'--jinja','--metrics','--cont-batching','--fit','off']
@@ -369,6 +419,10 @@ def command_preview(raw):
         args+=['--mmproj',str(proj)]
     if d['host']=='0.0.0.0' and not d['auth']:args+=['--no-slots']
     if d['auth']:args+=['--api-key-file',str(KEYS)]
+    opts=recovery_options(d)
+    if opts:
+        args=apply_recovery(args,opts)
+        e['danger'].append('복구 옵션 적용 중: 메모리 예상값과 GUI 설정이 최종 명령과 다를 수 있습니다. 실제 명령과 메모리를 확인하세요.')
     return d,e,args
 
 
@@ -401,10 +455,24 @@ def step(kind,args,cwd=None,env=None):
     if rc:raise RuntimeError(f'프로세스 종료 코드 {rc}. 로그에서 원인을 확인하세요.')
 
 
+def files_overlap(download_meta,server_meta):
+    # Conservative on missing metadata. Read-only inspect / HF install do not modify GGUFs.
+    if download_meta.get('read_only'):return False
+    if not download_meta.get('dest') or not download_meta.get('patterns') or not server_meta.get('files'):return True
+    base=Path(download_meta['dest']).resolve()
+    for f in server_meta['files']:
+        try: rel=Path(f).resolve().relative_to(base).as_posix()
+        except ValueError:continue
+        if any(fnmatch.fnmatchcase(rel.casefold(),pattern.casefold()) for pattern in download_meta['patterns']):return True
+    return False
+
+
 def start_task(kind,func,meta=None):
     with LOCK:
         if task_busy(kind):raise ValueError('이미 실행 중입니다.')
-        if (kind=='server' and any(task_busy(k) for k in ('build','download'))) or (kind in ('build','download') and task_busy('server')):raise ValueError('빌드와 서버 실행을 동시에 할 수 없습니다.')
+        if (kind=='server' and task_busy('build')) or (kind=='build' and task_busy('server')):raise ValueError('빌드와 서버 실행을 동시에 할 수 없습니다.')
+        if kind=='server' and task_busy('download') and files_overlap(TASKS['download']['meta'],meta or {}):raise ValueError('실행할 GGUF 또는 projector가 현재 다운로드 대상과 겹칩니다.')
+        if kind=='download' and task_busy('server') and files_overlap(meta or {},TASKS['server']['meta']):raise ValueError('다운로드 대상이 실행 중인 GGUF 또는 projector와 겹칩니다.')
         if (kind=='tune' and any(task_busy(k) for k in ('build','download','server','benchmark'))) or (kind in ('build','download','server','benchmark') and task_busy('tune')):raise ValueError('자동 튜닝은 다른 모델/서버 작업과 동시에 실행할 수 없습니다.')
         LOGS[kind].clear()
         TASKS[kind]={'active':True,'state':'running','started':time.time(),'proc':None,'cancel':False,'meta':meta or {}}
@@ -433,8 +501,7 @@ def stop_task(kind):
 
 
 def download(raw,inspect=False):
-    if not inspect and task_busy('server'):raise ValueError('모델 파일 변경을 방지하기 위해 서버를 중지한 뒤 다운로드하세요.')
-    d,p,q=validate(raw); base=repo_path(d); base.mkdir(parents=True,exist_ok=True)
+    d=raw;p,q=profile(d);base=repo_path(d);base.mkdir(parents=True,exist_ok=True)
     patterns=[q['pattern']]+([p['projector']] if d['vision'] and p.get('projector') else [])
     # API (not a version-dependent CLI module entry point); reruns reuse local metadata and partial cache.
     script='''import json,sys\nfrom huggingface_hub import HfApi,snapshot_download\nfrom fnmatch import fnmatch\nfrom pathlib import Path\nimport shutil\na=json.loads(sys.argv[1]); info=HfApi().model_info(a['repo'],revision=a['revision'],files_metadata=True); files=[s for s in info.siblings if any(fnmatch(s.rfilename,g) for g in a['patterns'])]; assert files, 'No files matched the configured pattern'; print('Revision:',info.sha,flush=True); print('\\n'.join(f'{s.rfilename} | {s.size} bytes' for s in files),flush=True); print('Total bytes:',sum(s.size or 0 for s in files),flush=True)\nif not a['inspect']:\n    dst=Path(a['dest']); need=sum(s.size or 0 for s in files if not ((dst/s.rfilename).is_file() and (dst/s.rfilename).stat().st_size==s.size)); free=shutil.disk_usage(dst).free; print('Remaining file budget (conservative):',need,'Free bytes:',free,flush=True)\n    if need>free: raise RuntimeError('Not enough disk space for remaining full files (partial cache not subtracted)')\n    snapshot_download(repo_id=a['repo'],revision=info.sha,local_dir=a['dest'],allow_patterns=a['patterns'],max_workers=2)\n'''
@@ -443,10 +510,10 @@ def download(raw,inspect=False):
         rc,_=run_capture([sys.executable,'-c','import huggingface_hub'])
         if rc:raise RuntimeError('huggingface_hub 없음. 환경 탭에서 설치하세요.')
         step('download',[sys.executable,'-u','-c',script,json.dumps(a,ensure_ascii=False)])
-    start_task('download',job)
+    start_task('download',job,{'dest':str(base),'patterns':patterns,'read_only':inspect,'profile':d['profile'],'quant':d['quant']})
 
 
-def install_hf():start_task('download',lambda:step('download',[sys.executable,'-m','pip','install','--upgrade','--only-binary=:all:','huggingface_hub']))
+def install_hf():start_task('download',lambda:step('download',[sys.executable,'-m','pip','install','--upgrade','--only-binary=:all:','huggingface_hub']),{'read_only':True})
 
 
 def set_task_meta(kind,**items):
@@ -581,11 +648,12 @@ def build(raw):
 
 def launch(raw):
     d,e,args=command_preview(raw)
-    if task_busy('download') or task_busy('benchmark'):raise ValueError('다운로드/파일 검사 또는 벤치마크 작업이 끝난 뒤 서버를 시작하세요.')
+    if task_busy('benchmark'):raise ValueError('벤치마크 작업이 끝난 뒤 서버를 시작하세요.')
     if e['danger'] and not raw.get('force'):return {'confirm':True,'danger':e['danger']}
     exe=find_server(d);f=resolve_model(d)
     if not exe:raise ValueError('llama-server를 먼저 빌드하거나 실행 파일 경로를 지정하세요.')
-    check_shards(f)
+    files=[str(a.resolve()) for a in check_shards(f)]
+    if '--mmproj' in args:files.append(str(Path(args[args.index('--mmproj')+1]).resolve()))
     if d['auth'] and not read_keys():raise ValueError('API 키를 먼저 생성하세요.')
     if not e['gpu_ids']:raise ValueError('사용할 NVIDIA GPU가 없습니다.')
     with socket.socket() as s:
@@ -596,7 +664,7 @@ def launch(raw):
     env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']));
     # Do not inherit unexpected API keys if the UI requests no authentication.
     for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE'):env.pop(k,None)
-    start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location']})
+    start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options','')})
     return {'started':True}
 
 
@@ -698,6 +766,7 @@ def benchmark(raw):
 def tune(raw):
     if any(task_busy(k) for k in ('build','download','server','benchmark','tune')):raise ValueError('다른 작업을 중지한 뒤 튜닝하세요.')
     d,_,_=validate(raw)
+    if recovery_options(d):raise ValueError('자동 튜닝 전에 복구 옵션을 비워 주세요.')
     if d['parallel']!=1 or d['unified']:raise ValueError('자동 튜닝은 단일 슬롯/비공유 KV 전용입니다.')
     if d['mode']!='hybrid' and not raw.get('allow_gpu_tune'):raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
     f=resolve_model(d);check_shards(f);exe=find_server(d)
@@ -764,6 +833,28 @@ def tune(raw):
         if best:log('tune','추천은 테스트한 후보와 입력 길이 기준이며 사용자가 적용하기 전에는 설정을 변경하지 않습니다.')
     start_task('tune',job)
 
+def diagnostic_command(raw):
+    cmd=str(raw.get('diagnostic','')).strip()
+    choices={'nvidia-smi':('nvidia-smi',[]),'nvidia-smi -q':('nvidia-smi',['-q']),
+             'nvcc --version':('nvcc',['--version']), 'llama-server --version':('server',['--version']),
+             'llama-server --help':('server',['--help']), 'llama-server --list-devices':('server',['--list-devices'])}
+    if cmd not in choices:raise ValueError('허용된 진단 명령만 입력하세요: '+', '.join(choices))
+    tool,flags=choices[cmd]
+    if tool=='server':exe=find_server(raw)
+    elif tool=='nvcc':
+        tk=cuda_toolkit(raw);exe=tk['nvcc'] if tk else None
+    else:exe=find_tool(tool)
+    if not exe:raise ValueError('실행 파일을 찾지 못했습니다: '+tool)
+    env=cuda_env(raw);env['PATH']=str(Path(exe).parent)+os.pathsep+env.get('PATH','')
+    rc,out=run_capture([str(exe),*flags],30,env=env)
+    return {'code':rc,'output':out[-120000:],'command':subprocess.list2cmdline([str(exe),*flags])}
+
+def error_excerpt(lines):
+    bad=[]
+    for ln in lines:
+        if re.search(r'error|failed|fatal|assert|exception|out of memory|invalid|자동 진단|종료 코드',ln,re.I) and not ln.startswith('> '):bad.append(ln)
+    return bad[-15:] if bad else lines[-8:]
+
 def status():
     with LOCK:
         ts={k:{x:v for x,v in t.items() if x not in ('proc','cancel')}|{'pid':t['proc'].pid if t['proc'] else None} for k,t in TASKS.items()}; logs={k:list(v) for k,v in LOGS.items()}
@@ -779,41 +870,45 @@ def status():
         for s in json.loads(slots):
             if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining') if k in s})
     except (ValueError,TypeError):pass
-    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:]}
+    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else []}
 
 
 def save_prefs(raw):
     global SETTINGS
     allowed=set(BASE['defaults'])|{'workspace','llama_dir','model_dir','server_exe','build_jobs','cuda_arch','llama_ref','cuda_root','runtime_cuda','runtime_tag'}
-    prefs={k:v for k,v in raw.items() if k in allowed};validate({**BASE['defaults'],**prefs});
+    prefs={k:v for k,v in raw.items() if k in allowed};validate({**BASE['defaults'],**prefs});recovery_options(prefs);
     with LOCK:
         tmp=PREF.with_suffix('.tmp');tmp.write_text(json.dumps(prefs,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(PREF);SETTINGS=prefs
     return {'ok':True}
 
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inkling Manager</title><style>
 :root{color-scheme:dark;--bg:#10151d;--panel:#19222e;--line:#344253;--fg:#edf2f7;--muted:#a5b5c7;--accent:#68d6b4;--warn:#f4be72}*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);font:14px/1.55 'Segoe UI',system-ui,sans-serif;margin:0}header{padding:22px max(24px,calc((100vw - 1260px)/2));background:#151e29;border-bottom:1px solid var(--line)}h1{margin:0;font-size:25px;letter-spacing:-.5px}h2{font-size:18px;margin:0 0 14px}h3{font-size:15px;margin:15px 0 8px}p{margin:8px 0;color:var(--muted)}main{max-width:1260px;margin:auto;padding:18px 24px 50px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}button,a.btn{border:1px solid var(--line);border-radius:7px;background:#253445;color:var(--fg);padding:9px 13px;font:inherit;cursor:pointer;text-decoration:none}button:hover{border-color:var(--accent)}button.active,button.primary{background:var(--accent);color:#0b211b;border-color:var(--accent);font-weight:650}button:disabled{opacity:.4;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:12px}.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}.panel{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:18px;margin-bottom:14px}.field{display:flex;flex-direction:column;gap:5px;margin:0 0 9px;min-width:0}.field>span{color:#c4d0df;font-size:13px}.field small{color:var(--muted)}input,select{width:100%;padding:9px 10px;background:#111923;color:var(--fg);border:1px solid var(--line);border-radius:6px;font:inherit;min-width:0}input[type=checkbox]{width:auto;margin-right:8px}label.check{display:flex;align-items:center;padding:8px 0}input:focus,select:focus{outline:1px solid var(--accent)}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.good{color:var(--accent)}.bad{color:#ff9992}.warn{color:var(--warn)}.muted{color:var(--muted)}.metric{background:#121b25;padding:13px;border-radius:8px;border:1px solid #2b3949}.metric b{display:block;font-size:23px;line-height:1.4;font-variant-numeric:tabular-nums}.bar{height:9px;background:#354254;border-radius:6px;overflow:hidden;margin:7px 0}.bar i{display:block;height:100%;background:var(--accent)}pre{background:#0c131c;border-radius:7px;padding:13px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:12px/1.55 Consolas,monospace;margin:8px 0}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left;overflow-wrap:anywhere}th{color:var(--muted)}a{color:#9cc9ff}.hidden{display:none!important}#toast{position:fixed;bottom:18px;right:18px;max-width:min(600px,95vw);background:#2c4252;border:1px solid #597a8d;border-radius:8px;padding:12px 16px;z-index:9;white-space:pre-wrap}#toast:empty{display:none}.lead{font-size:13px;color:var(--muted)}@media(max-width:850px){.cols{grid-template-columns:1fr}main{padding:12px}.panel{padding:13px}} </style></head><body>
-<header><h1>Easy LLM Manager v0.2 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
+<header><h1>Easy LLM Manager v0.2.1 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
 <section id="env" class="tab"><div class="cols"><div class="panel"><h2>환경 진단</h2><p>먼저 GPU와 필수 도구를 확인하세요. 설치 직후 PATH가 갱신되지 않았다면 이 도구를 다시 실행하세요.</p><div class="buttons"><button class="primary" onclick="diagnose()">환경 다시 검사</button><button onclick="act('install_hf',{})">HF 다운로드 도구 설치</button></div><div id="diagnosis"></div></div><div class="panel"><h2>저장 경로</h2><p>기존 AI 폴더 또는 여유 공간이 큰 고정 디스크를 탐색합니다. 필요하면 직접 수정하세요.</p><div id="pathFields"></div><div class="buttons"><button onclick="save()">경로/세팅 저장</button></div><p>모델, 빌드 결과는 작업 폴더에 저장합니다. 개인 설정과 API 키는 사용자 전용 데이터 폴더에 저장합니다.</p></div></div></section>
-<section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect')">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
+<section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><p>다운로드 선택은 서버 설정과 독립적입니다. 실행 중인 동일 파일은 보호됩니다.</p><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect',downloadForm())">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
 <section id="build" class="tab hidden"><div class="cols"><div class="panel"><h2>llama.cpp CUDA 빌드</h2><p>기존 소스를 재사용하고 없다면 공식 Git 저장소에서 clone합니다. Visual Studio C++ 빌드 도구와 CUDA Toolkit이 필요합니다.</p><div id="buildFields"></div><h3>공식 사전 컴파일 바이너리 (컴파일 대안)</h3><div id="runtimeFields"></div><div class="buttons"><button onclick="installBinary()">공식 CUDA 바이너리 설치</button><button onclick="useInstalled()">설치/빌드 결과 실행 파일 적용</button></div><p>GitHub 공식 릴리스만 사용합니다. CUDA 12/13은 드라이버와 호환되는 버전을 선택하세요.</p><label class="check"><input type="checkbox" id="fresh_build">새 빌드 폴더 사용 (기존 파일 유지)</label><label class="check"><input type="checkbox" id="update_source">기존 소스 업데이트 (변경사항이 없을 때만)</label><div class="buttons"><button class="primary" onclick="act('build')">컴파일 시작</button><button onclick="stop('build')">중지</button></div><p>H100은 CUDA arch 90. Git ref를 지정하면 해당 버전으로 빌드합니다. 최초 빌드는 오래 걸릴 수 있습니다.</p></div><div class="panel"><h2>빌드 로그</h2><pre id="buildLog"></pre><p>오류 시 마지막 로그와 환경 진단을 확인하세요. 기존 CMake 생성기와 충돌한다면 소스를 보존하고 build 폴더만 이름을 변경한 후 다시 빌드하세요.</p></div></div></section>
-<section id="run" class="tab hidden"><div class="cols"><div class="panel"><h2>추론 서버 설정</h2><div class="buttons"><button onclick="preset('safe')">첫 구동 (2 GPU)</button><button onclick="preset('long')">1M / GPU KV</button><button onclick="preset('host')">1M / RAM KV</button><button onclick="preset('team')">15인 공유 KV</button><button onclick="preset('q4long')">Q4 1M / 2 GPU</button></div><p>프리셋은 출발점일 뿐이며 GPU 장수와 선택 모델에 따라 조정하세요. 먼저 예상치를 계산하세요.</p><h3>모델 · 배치</h3><div id="runModel"></div><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진 · 네트워크</h3><div class="grid" id="advanced"></div><div class="buttons"><button onclick="save()">세팅 저장</button><button onclick="preview()">예상 자원 / 명령어</button><button onclick="plan()">자동 메모리 배치 추천</button><button class="primary" onclick="startServer()">서버 시작</button><button onclick="stop('server')">서버 중지</button></div></div><div><div class="panel"><h2>실행 전 메모리 예측</h2><div id="estimate"><p>설정을 선택한 후 예상 자원을 계산하세요.</p></div><p>GiB 단위. 실제 llama.cpp가 할당하는 메모리는 다를 수 있습니다.</p><h3>자동 배치 후보</h3><div id="plans"><p>선택한 모델/컨텍스트를 유지한 채 후보를 계산합니다.</p></div><h3>생성 명령어</h3><pre id="command"></pre></div><div class="panel"><h2>접속</h2><div id="connection"></div><p>로컬 브라우저에서 먼저 테스트한 후 사내 IP를 사용하세요. Claude Code 확장은 Anthropic Messages API 호환 여부를 별도 확인하세요.</p></div></div></div></section>
-<section id="monitor" class="tab hidden"><div class="panel"><h2>실시간 GPU · 서버 상태</h2><div id="gpuCards" class="grid"></div><div id="taskCards" class="grid"></div><div class="buttons"><button onclick="stop('server')">관리 중인 서버 중지</button><button onclick="poll()">즉시 갱신</button></div><div id="health"></div></div><div class="cols"><div class="panel"><h2>서버 로그 (최근 900줄)</h2><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><pre id="serverLog" style="max-height:560px"></pre></div><div class="panel"><h2>API /metrics · /slots</h2><div id="rates" class="grid"></div><pre id="metrics"></pre><pre id="slots"></pre></div></div></section>
+<section id="run" class="tab hidden"><div class="cols"><div class="panel"><h2>추론 서버 설정</h2><div class="buttons"><button onclick="preset('safe')">첫 구동 (2 GPU)</button><button onclick="preset('long')">1M / GPU KV</button><button onclick="preset('host')">1M / RAM KV</button><button onclick="preset('team')">15인 공유 KV</button><button onclick="preset('q4long')">Q4 1M / 2 GPU</button></div><p>프리셋은 출발점일 뿐이며 GPU 장수와 선택 모델에 따라 조정하세요. 먼저 예상치를 계산하세요.</p><h3>모델 · 배치</h3><div id="runModel"></div><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진 · 네트워크</h3><div class="grid" id="advanced"></div><h3>오류 복구 옵션 (고급)</h3><p>실행 명령에 옵션을 추가/제거/변경합니다. 예: --flash-attn off 또는 --no-mmap. null은 제거, true는 스위치 추가입니다. 일반 설정에서 바꿀 수 있는 값은 그곳에서 변경하세요.</p><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--flash-attn":"off","--no-warmup":true,"--no-kv-unified":null}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="preset('rescue')">8K 안전 구동</button></div><div class="buttons"><button onclick="save()">세팅 저장</button><button onclick="preview()">예상 자원 / 명령어</button><button onclick="plan()">자동 메모리 배치 추천</button><button class="primary" onclick="startServer()">서버 시작</button><button onclick="stop('server')">서버 중지</button></div></div><div><div class="panel"><h2>실행 전 메모리 예측</h2><div id="estimate"><p>설정을 선택한 후 예상 자원을 계산하세요.</p></div><p>GiB 단위. 실제 llama.cpp가 할당하는 메모리는 다를 수 있습니다.</p><h3>자동 배치 후보</h3><div id="plans"><p>선택한 모델/컨텍스트를 유지한 채 후보를 계산합니다.</p></div><h3>생성 명령어</h3><pre id="command"></pre></div><div class="panel"><h2>접속</h2><div id="connection"></div><p>로컬 브라우저에서 먼저 테스트한 후 사내 IP를 사용하세요. Claude Code 확장은 Anthropic Messages API 호환 여부를 별도 확인하세요.</p></div></div></div></section>
+<section id="monitor" class="tab hidden"><div class="panel"><h2>실시간 GPU · 서버 상태</h2><div id="gpuCards" class="grid"></div><div id="taskCards" class="grid"></div><div class="buttons"><button onclick="stop('server')">관리 중인 서버 중지</button><button onclick="poll()">즉시 갱신</button></div><div id="health"></div></div><div class="cols"><div class="panel"><h2>서버 로그 (최근 900줄)</h2><h3>최근 실행 요청 오류</h3><pre id="actionError">—</pre><h3>실패 로그 핵심 (자동 추출)</h3><pre id="serverErrors">—</pre><h3>로컬 진단 명령</h3><p>서버 외부로 전송하지 않습니다. 허용된 진단 명령만 실행합니다.</p><input id="diagCommand" list="diagList" value="llama-server --version"><datalist id="diagList"><option value="llama-server --version"><option value="llama-server --help"><option value="llama-server --list-devices"><option value="nvidia-smi"><option value="nvidia-smi -q"><option value="nvcc --version"></datalist><div class="buttons"><button onclick="runDiagnostic()">진단 실행</button></div><pre id="diagOutput"></pre><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><pre id="serverLog" style="max-height:560px"></pre></div><div class="panel"><h2>API /metrics · /slots</h2><div id="rates" class="grid"></div><pre id="metrics"></pre><pre id="slots"></pre></div></div></section>
 <section id="tuning" class="tab hidden"><div class="panel"><h2>실측 벤치마크 · 자동 튜닝</h2><p>합성 토큰만 사용합니다. 단일 슬롯에서 테스트하세요. 자동 튜닝은 서버를 중지한 상태에서 여러 후보를 직접 로딩하고 실패 시 다음 후보로 이동합니다. 1M 설정은 매우 오래 걸릴 수 있습니다. 입력 길이를 짧게 시작하세요.</p><div class="grid"><label class="field"><span>입력 토큰 수</span><input type="number" id="bench_prompt" value="512" min="32" max="1048576"></label><label class="field"><span>생성 토큰 수</span><input type="number" id="bench_output" value="128" min="16" max="1024"></label></div><div class="buttons"><button onclick="runBench(false)">실행 중 서버 벤치마크</button><button class="primary" onclick="runBench(true)">자동 튜닝 (서버 중지 후)</button><button onclick="stop('tune')">튜닝 중지</button><button onclick="applyBest()">가장 빠른 실측 후보 적용</button></div><div id="tuneBest"></div><h3>최근 측정 (최대 10개)</h3><div id="history"></div><h3>벤치마크 로그</h3><pre id="benchmarkLog"></pre><h3>튜닝 로그</h3><pre id="tuneLog"></pre></div></section><section id="auth" class="tab hidden"><div class="panel"><h2>API 접근 키</h2><p>기본값은 인증 없음 + localhost. 사내 네트워크에서 서비스할 때만 승인된 범위에 노출하고 API 키 사용을 권장합니다. 키 활성화는 실행 설정에서 별도로 선택하세요. 키 추가/회수 후 재시작이 필요합니다.</p><div class="buttons"><button class="primary" onclick="key('add')">새 API 키 생성</button></div><div id="newKey"></div><div id="keyList"></div><p>키는 사용자 전용 디렉터리의 api-keys.txt에 저장되며 Git에 포함되지 않습니다. 사용자별 요청량 할당/회계는 제공하지 않습니다.</p></div></section></main><div id="toast" role="status"></div>
 <script>
-const csrf=__TOKEN__; let config, form={}, prev=null, polling=false, current='env', plans=[]; const $=x=>document.getElementById(x); const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); const fmt=x=>x==null?'—':Number(x).toFixed(1); let toastTimer;
+const csrf=__TOKEN__; let config, form={}, prev=null, polling=false, current='env', plans=[], dl={}; const $=x=>document.getElementById(x); const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); const fmt=x=>x==null?'—':Number(x).toFixed(1); let toastTimer;
 function toast(x){$('toast').textContent=x;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').textContent='',10000)}
 async function api(path,body){const opt={headers:{'X-Manager-Token':csrf}};if(body!==undefined){opt.method='POST';opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body)} const r=await fetch('/api/'+path,opt);let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
 const tabs=[['env','1 환경'],['download','2 다운로드'],['build','3 컴파일'],['run','4 서버 실행'],['monitor','5 모니터링'],['tuning','6 성능 튜닝'],['auth','7 API 키']]; $('nav').innerHTML=tabs.map(([k,t])=>`<button id="nav_${k}" onclick="tab('${k}')">${t}</button>`).join('');function tab(k){current=k;for(const [x] of tabs){$(x).classList.toggle('hidden',x!==k);$('nav_'+x).classList.toggle('active',x===k)}if(k==='auth')keys();if(k==='run')connection()}
 function field(k,label,type='text',choices=null,help=''){let v=form[k]??'';let inner=type==='check'?`<label class="check"><input data-k="${k}" type="checkbox" ${v?'checked':''}>${esc(label)}</label>`:type==='select'?`<label class="field"><span>${esc(label)}</span><select data-k="${k}">${choices.map(([x,t])=>`<option value="${esc(x)}" ${String(x)===String(v)?'selected':''}>${esc(t)}</option>`).join('')}</select>`:`<label class="field"><span>${esc(label)}</span><input data-k="${k}" type="${type}" ${type==='number'?'step="any"':''} value="${esc(v)}">`;return inner+(type==='check'?'':(help?`<small>${esc(help)}</small>`:'')+'</label>')}
 function wire(){document.querySelectorAll('[data-k]').forEach(el=>el.onchange=()=>{const k=el.dataset.k;form[k]=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value;plans=[];if($('plans'))$('plans').textContent='설정 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='profile'){form.quant=Object.keys(config.model_profiles[form.profile].quants)[0];form.model_path='';render()}else if(k==='quant'){form.model_path='';render()}else{document.querySelectorAll(`[data-k="${k}"]`).forEach(x=>{if(x!==el){if(x.type==='checkbox')x.checked=form[k];else x.value=form[k]}});connection()}})}
+function downloadForm(){return {...form,...dl,model_path:''}}
+function renderDownload(){const p=config.model_profiles[dl.profile],q=p.quants[dl.quant];$('modelFields').innerHTML=`<label class="field"><span>다운로드 모델 계열</span><select id="dlProfile">${Object.entries(config.model_profiles).map(([k,v])=>`<option value="${esc(k)}" ${k===dl.profile?'selected':''}>${esc(v.label)}</option>`).join('')}</select></label><label class="field"><span>다운로드 양자화</span><select id="dlQuant">${Object.entries(p.quants).map(([k,v])=>`<option value="${esc(k)}" ${k===dl.quant?'selected':''}>${esc(k)} · ${v.gb} GB</option>`).join('')}</select></label><label class="check"><input type="checkbox" id="dlVision" ${dl.vision?'checked':''}>Vision projector 포함</label>`;$('dlProfile').onchange=()=>{dl.profile=$('dlProfile').value;dl.quant=Object.keys(config.model_profiles[dl.profile].quants)[0];renderDownload()};$('dlQuant').onchange=()=>{dl.quant=$('dlQuant').value;renderDownload()};$('dlVision').onchange=()=>{dl.vision=$('dlVision').checked};$('modelSpec').innerHTML=`<div class="grid">${metric('파일 용량',q.gb+' GB',fmt(q.gb*1e9/1073741824)+' GiB')}${metric('원본 top-token 일치율',q.agreement==null?'—':q.agreement+'%','품질 벤치마크 점수 아님')}</div>`}
+function clearRecovery(){form.recovery_options='';$('recovery').value='';preview()}
+async function runDiagnostic(){await guard(async()=>{const r=await api('diagnostic_command',{...form,diagnostic:$('diagCommand').value});$('diagOutput').textContent=r.command+'\nexit '+r.code+'\n'+r.output})}
 function models(){let p=config.model_profiles[form.profile];return field('profile','모델 계열','select',Object.entries(config.model_profiles).map(([k,v])=>[k,v.label]))+field('quant','양자화','select',Object.entries(p.quants).map(([k,v])=>[k,`${k} · ${v.gb} GB`]))+field('vision','Vision projector 포함','check')}
-function render(){let p=config.model_profiles[form.profile],q=p.quants[form.quant];$('pathFields').innerHTML=field('workspace','작업 폴더')+field('llama_dir','llama.cpp 소스 폴더','text',null,'비워 두면 작업폴더/llama.cpp')+field('model_dir','모델 폴더','text',null,'비워 두면 작업폴더/models')+field('server_exe','기존 llama-server.exe 직접 지정','text',null,'비워 두면 자동 탐색');$('modelFields').innerHTML=models();$('runModel').innerHTML=models()+field('model_path','첫 GGUF 파일 직접 지정 (선택)','text',null,'자동 감지에 실패했거나 기존 다운로드를 사용하려면 지정');$('modelSpec').innerHTML=`<div class="grid"><div class="metric">파일 용량<b>${q.gb} GB</b><small>${fmt(q.gb*1e9/1073741824)} GiB</small></div><div class="metric">원본 top-token 일치율<b>${q.agreement==null?'—':q.agreement+'%'}</b><small>품질 벤치마크 점수 아님</small></div></div><p>최대 ${p.max_context.toLocaleString()} 토큰 · <a target="_blank" rel="noreferrer" href="https://huggingface.co/${esc(p.repo)}">모델 카드</a></p>`;$('runtimeFields').innerHTML=field('runtime_cuda','공식 바이너리 CUDA','select',[['12','CUDA 12 (구형 드라이버 우선 확인)'],['13','CUDA 13 (신형 드라이버)']])+field('runtime_tag','공식 릴리스 태그 (선택)','text',null,'비워 두면 최근 안정 릴리스 중 DLL 쌍 탐색');$('buildFields').innerHTML=field('cuda_root','CUDA Toolkit 폴더 (선택)','text',null,'비워 두면 설치된 최신 nvcc 탐색; v12.2 등 전체 경로 지정 가능')+field('cuda_arch','CUDA Architecture')+field('build_jobs','병렬 빌드 작업 수','number')+field('llama_ref','Git ref / 태그 / 커밋 (선택)','text',null,'비워 두면 현재 소스 유지, 최초 clone은 기본 브랜치');$('placement').innerHTML=field('mode','가중치 모드','select',[['gpu','GPU 전체 상주'],['hybrid','GPU + CPU MoE']])+field('cpu_layers','CPU MoE 레이어 수','number',null,'앞 N개 레이어 Expert만 RAM에 저장')+field('expert_cache','동적 GPU Expert cache (MiB)','number',null,'0 = 끔 / 최신 빌드 기능')+field('cpu_share','캐시 miss CPU 연산 비율 (0~1)','number')+field('expert_verbose','Expert 캐시 상세 로그 (디버그)','check')+field('gpu_ids','GPU 번호 (예: 0,1)','text',null,'비워 두면 모든 GPU')+field('split','GPU 배치 비율 (예: 1,1)','text',null,'비워 두면 여유 VRAM 비례');$('contexts').innerHTML=field('context','슬롯당 최대 컨텍스트','number')+field('parallel','동시 슬롯 수','number')+field('unified','공유 KV 풀 사용','check')+field('pool','전체 공유 KV 풀 토큰','number',null,'공유 모드에서만 사용')+field('kv_location','활성 KV 위치','select',[['gpu','GPU (권장)'],['cpu','RAM / CPU (느릴 수 있음)']])+field('kv_type','KV 정밀도','select',[['f16','FP16 (호환성 우선)'],['q8_0','Q8_0'],['q4_0','Q4_0 (실험)']])+field('ram_cache','RAM prompt cache 상한 (MiB)','number',null,'0 = 끔; 유휴 슬롯/프롬프트 보관')+field('runtime_reserve','GPU 기타 여유 공간 (GiB)','number')+field('ram_reserve','RAM 기타 여유 공간 (GiB)','number');$('advanced').innerHTML=field('batch','logical batch','number')+field('ubatch','physical ubatch','number')+field('threads','CPU 연산 스레드','number')+field('reasoning','Reasoning effort','select',['none','minimal','low','medium','high','xhigh','max'].map(x=>[x,x]))+field('alias','API 모델 이름')+field('host','접속 범위','select',[['127.0.0.1','이 서버에서만'],['0.0.0.0','사내망 접속 (승인 필요)']])+field('port','API 포트','number')+field('auth','API 키 인증 사용','check');wire();connection()}
-function preset(k){plans=[];$('plans').textContent='프리셋 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='safe')Object.assign(form,{mode:'hybrid',cpu_layers:8,expert_cache:0,cpu_share:0,context:32768,pool:32768,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:512,ubatch:128});if(k==='long')Object.assign(form,{context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0});if(k==='host')Object.assign(form,{mode:'gpu',context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'cpu',kv_type:'f16',ram_cache:0});if(k==='team')Object.assign(form,{mode:'gpu',parallel:15,context:1048576,pool:1572864,unified:true,kv_location:'gpu',kv_type:'q8_0',ram_cache:65536});if(k==='q4long'){Object.assign(form,{profile:'inkling2',quant:'UD-Q4_K_XL',model_path:'',mode:'hybrid',cpu_layers:32,expert_cache:8192,cpu_share:0.5,context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0,batch:512,ubatch:128});}render();preview()}
-async function guard(fn){try{return await fn()}catch(e){toast(e.message);return null}}
+function render(){let p=config.model_profiles[form.profile],q=p.quants[form.quant];$('pathFields').innerHTML=field('workspace','작업 폴더')+field('llama_dir','llama.cpp 소스 폴더','text',null,'비워 두면 작업폴더/llama.cpp')+field('model_dir','모델 폴더','text',null,'비워 두면 작업폴더/models')+field('server_exe','기존 llama-server.exe 직접 지정','text',null,'비워 두면 자동 탐색');renderDownload();$('runModel').innerHTML=models()+field('model_path','첫 GGUF 파일 직접 지정 (선택)','text',null,'자동 감지에 실패했거나 기존 다운로드를 사용하려면 지정');$('runtimeFields').innerHTML=field('runtime_cuda','공식 바이너리 CUDA','select',[['12','CUDA 12 (구형 드라이버 우선 확인)'],['13','CUDA 13 (신형 드라이버)']])+field('runtime_tag','공식 릴리스 태그 (선택)','text',null,'비워 두면 최근 안정 릴리스 중 DLL 쌍 탐색');$('buildFields').innerHTML=field('cuda_root','CUDA Toolkit 폴더 (선택)','text',null,'비워 두면 설치된 최신 nvcc 탐색; v12.2 등 전체 경로 지정 가능')+field('cuda_arch','CUDA Architecture')+field('build_jobs','병렬 빌드 작업 수','number')+field('llama_ref','Git ref / 태그 / 커밋 (선택)','text',null,'비워 두면 현재 소스 유지, 최초 clone은 기본 브랜치');$('placement').innerHTML=field('mode','가중치 모드','select',[['gpu','GPU 전체 상주'],['hybrid','GPU + CPU MoE']])+field('cpu_layers','CPU MoE 레이어 수','number',null,'앞 N개 레이어 Expert만 RAM에 저장')+field('expert_cache','동적 GPU Expert cache (MiB)','number',null,'0 = 끔 / 최신 빌드 기능')+field('cpu_share','캐시 miss CPU 연산 비율 (0~1)','number')+field('expert_verbose','Expert 캐시 상세 로그 (디버그)','check')+field('gpu_ids','GPU 번호 (예: 0,1)','text',null,'비워 두면 모든 GPU')+field('split','GPU 배치 비율 (예: 1,1)','text',null,'비워 두면 여유 VRAM 비례');$('contexts').innerHTML=field('context','슬롯당 최대 컨텍스트','number')+field('parallel','동시 슬롯 수','number')+field('unified','공유 KV 풀 사용','check')+field('pool','전체 공유 KV 풀 토큰','number',null,'공유 모드에서만 사용')+field('kv_location','활성 KV 위치','select',[['gpu','GPU (권장)'],['cpu','RAM / CPU (느릴 수 있음)']])+field('kv_type','KV 정밀도','select',[['f16','FP16 (호환성 우선)'],['q8_0','Q8_0'],['q4_0','Q4_0 (실험)']])+field('ram_cache','RAM prompt cache 상한 (MiB)','number',null,'0 = 끔; 유휴 슬롯/프롬프트 보관')+field('runtime_reserve','GPU 기타 여유 공간 (GiB)','number')+field('ram_reserve','RAM 기타 여유 공간 (GiB)','number');$('advanced').innerHTML=field('batch','logical batch','number')+field('ubatch','physical ubatch','number')+field('threads','CPU 연산 스레드','number')+field('reasoning','Reasoning effort','select',['none','minimal','low','medium','high','xhigh','max'].map(x=>[x,x]))+field('alias','API 모델 이름')+field('host','접속 범위','select',[['127.0.0.1','이 서버에서만'],['0.0.0.0','사내망 접속 (승인 필요)']])+field('port','API 포트','number')+field('auth','API 키 인증 사용','check');$('recovery').value=form.recovery_options||'';$('recovery').oninput=()=>{form.recovery_options=$('recovery').value;plans=[]};wire();connection()}
+function preset(k){plans=[];$('plans').textContent='프리셋 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='rescue'){let cpu={'UD-IQ1_S':8,'UD-IQ1_M':10,'UD-IQ2_XXS':12,'UD-Q2_K_XL':14,'UD-IQ3_XXS':18,'UD-Q3_K_XL':24,'UD-Q4_K_XL':32}[form.quant]??Math.min(8,config.model_profiles[form.profile].layers);Object.assign(form,{mode:'hybrid',cpu_layers:form.profile==='inkling2'?cpu:Math.min(cpu,config.model_profiles[form.profile].layers),expert_cache:0,cpu_share:0,expert_verbose:false,context:8192,pool:8192,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:256,ubatch:128,recovery_options:''})}if(k==='safe')Object.assign(form,{mode:'hybrid',cpu_layers:8,expert_cache:0,cpu_share:0,context:32768,pool:32768,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:512,ubatch:128});if(k==='long')Object.assign(form,{context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0});if(k==='host')Object.assign(form,{mode:'gpu',context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'cpu',kv_type:'f16',ram_cache:0});if(k==='team')Object.assign(form,{mode:'gpu',parallel:15,context:1048576,pool:1572864,unified:true,kv_location:'gpu',kv_type:'q8_0',ram_cache:65536});if(k==='q4long'){Object.assign(form,{profile:'inkling2',quant:'UD-Q4_K_XL',model_path:'',mode:'hybrid',cpu_layers:32,expert_cache:8192,cpu_share:0.5,context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0,batch:512,ubatch:128});}render();preview()}
+async function guard(fn){try{return await fn()}catch(e){toast(e.message);$('actionError').textContent=e.message;return null}}
 async function act(name,data=form){return guard(async()=>{let r=await api(name,{...data,update_source:$('update_source').checked,fresh_build:$('fresh_build').checked});toast('요청 접수: '+name);poll();return r})}
 async function stop(kind){if(confirm(kind+' 작업을 중지할까요?'))await act('stop',{kind})}
 async function save(){await guard(async()=>{await api('save',form);toast('사용자 설정 저장 완료')})}
-async function downloadModel(){let q=config.model_profiles[form.profile].quants[form.quant];if(confirm(`${form.quant} 약 ${q.gb} GB를 다운로드/이어받기 할까요? 실제 크기는 로그에서 확인됩니다.`))await act('download')}
+async function downloadModel(){let q=config.model_profiles[dl.profile].quants[dl.quant];if(confirm(`${dl.quant} 약 ${q.gb} GB를 다운로드/이어받기 할까요? 실제 크기는 로그에서 확인됩니다.`))await act('download',downloadForm())}
 async function diagnose(){await guard(async()=>{let r=await api('diagnose',form);$('diagnosis').innerHTML=`<p>Python ${esc(r.python)} · 모델 디스크 여유 ${fmt(r.disk.free)} GiB</p><table><tr><th>항목</th><th>상태 / 경로</th></tr>${r.items.map(x=>`<tr><td>${esc(x.name)}</td><td><span class="${x.ok?'good':'bad'}">${x.ok?'정상':'확인 필요'}</span> <a href="${esc(x.link)}" target="_blank" rel="noreferrer">설치/안내</a><div class="muted">${esc(x.detail)}</div></td></tr>`).join('')}</table><pre>${esc(JSON.stringify(r.paths,null,2))}</pre>`;toast('환경 검사 완료')})}
 function metric(k,v,h=''){return `<div class="metric"><small>${esc(k)}</small><b>${esc(v)}</b><small>${esc(h)}</small></div>`}
 async function preview(){return guard(async()=>{let r=await api('preview',form),e=r.estimate;$('estimate').innerHTML=`<div class="grid">${metric('예상 VRAM',fmt(e.gpu)+' GiB','여유 '+fmt(e.vfree))}${metric('예상 RAM 예산',fmt(e.host_ram)+' GiB','여유 '+fmt(e.ram_free))}${metric('GPU 상주 가중치',fmt(e.gpu_weight)+' GiB','CPU '+fmt(e.cpu_weight))}${metric('활성 KV',fmt(e.kv)+' GiB','SWA 미절약 시 '+fmt(e.kv_worst))}${metric('KV pool',e.pool.toLocaleString(),'tokens')}${metric('전체 가중치',fmt(e.weight)+' GiB','디스크 여유 '+fmt(e.archive_free))}</div><p>GPU별 추정: ${e.gpu_allocation.map((x,i)=>`GPU ${e.gpu_ids[i]}: ${fmt(x)} GiB`).join(' / ')||'—'}</p><p>모델: ${esc(e.model||'아직 다운로드 안 됨 / 경로 미지정')}</p>${e.danger.map(x=>`<p class="bad">⚠ ${esc(x)}</p>`).join('')}${e.warnings.map(x=>`<p class="warn">• ${esc(x)}</p>`).join('')}`;$('command').textContent=r.command;return r})}
@@ -830,9 +925,9 @@ async function startServer(){let pr=await preview();if(!pr)return;const dangers=
 function connection(meta=null){if(!config)return;let p=meta?.port||form.port,host=meta?.host||form.host,alias=meta?.alias||form.alias;let base=`http://127.0.0.1:${p}`;$('connection').innerHTML=`<a href="${base}" target="_blank" rel="noreferrer">llama.cpp 채팅 UI 열기</a><pre>OpenAI: ${base}/v1\nAnthropic: ${base}\nModel: ${esc(alias)}\n${host==='0.0.0.0'?'원격 노트북은 127.0.0.1 대신 실제 서버 IP 사용':'현재 로컬 전용'}</pre>`}
 function logs(id,items,follow=true){const x=$(id),v=items.join('\n');if(x.textContent!==v){x.textContent=v;if(follow)x.scrollTop=x.scrollHeight}}
 function rateMetrics(m){let out=[];for(const ln of m.split('\n')){if(ln.startsWith('#'))continue;const z=ln.match(/^([^\s{]+)(?:\{[^}]*\})?\s+([\d.eE+\-]+)$/);if(z&&/tokens_per_second|requests_processing|requests_deferred|kv_cache_usage|predicted_tokens_total|prompt_tokens_total/.test(z[1]))out.push(metric(z[1].replace(/^llamacpp:/,''),fmt(Number(z[2]))))}return out.slice(0,12).join('')}
-async function poll(){if(polling||!config)return;polling=true;try{let s=await api('status');prev=s;let st=s.tasks.server;let total=s.gpu.reduce((a,g)=>a+g.total,0),used=s.gpu.reduce((a,g)=>a+g.used,0);$('summary').innerHTML=metric('GPU VRAM',fmt(used)+' / '+fmt(total)+' GiB',`${s.gpu.length} GPU`)+metric('RAM 여유',fmt(s.ram_free)+' GiB','전체 '+fmt(s.ram_total)+' GiB')+metric('추론 서버',st?.active?(s.health?'응답 중':'시작/로딩 중'):(st?.state||'미실행'),st?.pid?'PID '+st.pid:'');$('gpuCards').innerHTML=s.gpu.map(g=>`<div class="metric"><small>GPU ${g.index} · ${esc(g.name)}</small><b>${fmt(g.used)} / ${fmt(g.total)} GiB</b><div class="bar"><i style="width:${Math.min(100,g.used/g.total*100)}%"></i></div><small>GPU ${fmt(g.util)}% · ${fmt(g.temp)}°C · ${fmt(g.power)}W</small></div>`).join('')||'<p>GPU 미감지</p>';$('taskCards').innerHTML=['download','build','server','benchmark','tune'].map(k=>metric(k,s.tasks[k]?.state||'idle',s.tasks[k]?.pid?'PID '+s.tasks[k].pid:'')).join('');$('health').textContent=s.health||'서버 health 응답 없음';logs('downloadLog',s.logs.download);logs('buildLog',s.logs.build);logs('serverLog',s.logs.server,$('follow').checked);$('metrics').textContent=s.metrics||'metrics 응답 없음';$('slots').textContent=JSON.stringify(s.slots,null,2);$('rates').innerHTML=rateMetrics(s.metrics)+(s.cache_stats?.samples?metric('Expert cache hit (최근 로그)',fmt(s.cache_stats.hit_rate)+'%',s.cache_stats.samples+' samples'):metric('Expert cache hit','—','지원 로그가 있을 때만 표시'));benchView(s);if(st?.active)connection(st.meta)}catch(e){$('health').textContent=e.message}finally{polling=false}}
+async function poll(){if(polling||!config)return;polling=true;try{let s=await api('status');prev=s;let st=s.tasks.server;let total=s.gpu.reduce((a,g)=>a+g.total,0),used=s.gpu.reduce((a,g)=>a+g.used,0);$('summary').innerHTML=metric('GPU VRAM',fmt(used)+' / '+fmt(total)+' GiB',`${s.gpu.length} GPU`)+metric('RAM 여유',fmt(s.ram_free)+' GiB','전체 '+fmt(s.ram_total)+' GiB')+metric('추론 서버',st?.active?(s.health?'응답 중':'시작/로딩 중'):(st?.state||'미실행'),st?.pid?'PID '+st.pid:'');$('gpuCards').innerHTML=s.gpu.map(g=>`<div class="metric"><small>GPU ${g.index} · ${esc(g.name)}</small><b>${fmt(g.used)} / ${fmt(g.total)} GiB</b><div class="bar"><i style="width:${Math.min(100,g.used/g.total*100)}%"></i></div><small>GPU ${fmt(g.util)}% · ${fmt(g.temp)}°C · ${fmt(g.power)}W</small></div>`).join('')||'<p>GPU 미감지</p>';$('taskCards').innerHTML=['download','build','server','benchmark','tune'].map(k=>metric(k,s.tasks[k]?.state||'idle',s.tasks[k]?.pid?'PID '+s.tasks[k].pid:'')).join('');$('health').textContent=s.health||'서버 health 응답 없음';logs('downloadLog',s.logs.download);logs('buildLog',s.logs.build);logs('serverLog',s.logs.server,$('follow').checked);$('serverErrors').textContent=(s.server_errors||[]).join('\n')||'—';$('metrics').textContent=s.metrics||'metrics 응답 없음';$('slots').textContent=JSON.stringify(s.slots,null,2);$('rates').innerHTML=rateMetrics(s.metrics)+(s.cache_stats?.samples?metric('Expert cache hit (최근 로그)',fmt(s.cache_stats.hit_rate)+'%',s.cache_stats.samples+' samples'):metric('Expert cache hit','—','지원 로그가 있을 때만 표시'));benchView(s);if(st?.active)connection(st.meta)}catch(e){$('health').textContent=e.message}finally{polling=false}}
 async function keys(){await guard(async()=>drawKeys((await api('keys')).keys))}function drawKeys(a){$('keyList').innerHTML=a.length?`<table><tr><th>키</th><th>관리</th></tr>${a.map(x=>`<tr><td>${esc(x.mask)}</td><td><button onclick="key('remove',${x.index})">회수</button></td></tr>`).join('')}</table>`:'<p>등록된 키 없음</p>'}async function key(action,index){if(action==='remove'&&!confirm('이 키를 회수할까요?'))return;await guard(async()=>{let r=await api('key',{action,index});drawKeys(r.keys);if(r.new){$('newKey').innerHTML='<p class="warn">새 키 (한 번만 표시 · 안전하게 보관)</p><pre></pre><button onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">복사</button>';$('newKey').querySelector('pre').textContent=r.new}else $('newKey').innerHTML='';toast('키 변경 완료; 서버 재시작 후 적용')})}
-(async()=>{try{config=await api('config');form=config.form;render();tab('env');diagnose();poll();setInterval(poll,3000)}catch(e){toast(e.message)}})();
+(async()=>{try{config=await api('config');form=config.form;dl={profile:form.profile,quant:form.quant,vision:form.vision};render();tab('env');diagnose();poll();setInterval(poll,3000)}catch(e){toast(e.message)}})();
 </script></body></html>'''
 
 
@@ -866,6 +961,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0<length<200000:return self.send(413,{'error':'invalid request size'})
             raw=json.loads(self.rfile.read(length));d={**BASE['defaults'],**SETTINGS,**raw}; action=self.path.removeprefix('/api/');result={'ok':True}
             if action=='diagnose':result=diagnostics(d)
+            elif action=='diagnostic_command':result=diagnostic_command(d)
             elif action=='save':result=save_prefs(d)
             elif action=='preview':
                 _,e,args=command_preview(d);result={'estimate':e,'command':subprocess.list2cmdline(args)}

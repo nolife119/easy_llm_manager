@@ -99,7 +99,8 @@
     "vision": false,
     "unified": false,
     "model_path": "",
-    "expert_verbose": false
+    "expert_verbose": false,
+    "recovery_options": ""
   },
   "cuda_root": "",
   "runtime_cuda": "12",
