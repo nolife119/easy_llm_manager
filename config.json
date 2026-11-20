@@ -39,12 +39,12 @@
           "pattern": "UD-IQ2_XXS/*"
         },
         "UD-Q2_K_XL": {
-          "gb": 205.0,
+          "gb": 205,
           "agreement": 92.7,
           "pattern": "UD-Q2_K_XL/*"
         },
         "UD-IQ3_XXS": {
-          "gb": 226.0,
+          "gb": 226,
           "agreement": 93.3,
           "pattern": "UD-IQ3_XXS/*"
         },
@@ -55,7 +55,7 @@
         },
         "UD-Q4_K_XL": {
           "gb": 354.2,
-          "agreement": 98.0,
+          "agreement": 98,
           "pattern": "UD-Q4_K_XL/*"
         },
         "UD-Q8_K_XL": {
@@ -65,7 +65,7 @@
         },
         "BF16": {
           "gb": 484.4,
-          "agreement": 100.0,
+          "agreement": 100,
           "pattern": "BF16/*"
         }
       }
@@ -100,7 +100,8 @@
     "unified": false,
     "model_path": "",
     "expert_verbose": false,
-    "recovery_options": ""
+    "recovery_options": "",
+    "load_mode": "auto"
   },
   "cuda_root": "",
   "runtime_cuda": "12",
