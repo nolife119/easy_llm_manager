@@ -177,7 +177,18 @@ def engine_inventory(d=None):
                 except (OSError,ValueError):pass
                 break
         found.append({'path':str(f),'commit':manifest.get('commit',''),'kind':manifest.get('kind','unknown'),'matches':bool(source['head'] and manifest.get('commit')==source['head'] and manifest.get('clean') and source['dirty'] is False)})
-    return {'source':source,'engines':found,'selected':str(find_server(d) or '')}
+    selected=find_server(d)
+    version=''
+    features={}
+    if selected:
+        env=cuda_env(d);env['PATH']=str(selected.parent)+os.pathsep+env.get('PATH','')
+        rc,out=run_capture([selected,'--version'],15,env=env)
+        version=out.strip()[-1500:]
+        try:
+            h=engine_help(str(selected),env)
+            features={flag:help_has(h,flag) for flag in ('--n-cpu-moe','--moe-cache-mib','--moe-cache-cpu-share','--no-mmproj','--cache-type-k','--kv-unified','--chat-template-kwargs')}
+        except (ValueError,OSError):pass
+    return {'source':source,'engines':found,'selected':str(selected or ''),'version':version,'features':features}
 
 def find_server(d=None):
     _,l,_,x=paths(d)
@@ -516,6 +527,13 @@ def recommend_setup(raw):
     elif strategy=='static':candidates=static
     elif strategy=='dynamic':candidates=dynamic
     else:candidates=static or dynamic
+    if strategy=='dynamic':
+        exe=find_server(d)
+        if exe:
+            env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
+            h=engine_help(str(exe),env)
+            if not all(help_has(h,k) for k in ('--moe-cache-mib','--moe-cache-cpu-share')):
+                return {'ok':False,'message':'선택된 엔진에 동적 Expert 캐시 옵션이 없습니다. 정적 CPU Expert 분산을 선택하세요.'}
     if not candidates:
         return {'ok':False,'message':'현재 선택 조건에 맞는 메모리 배치가 없습니다. 컨텍스트/슬롯, 양자화 또는 KV 위치를 변경하세요. 요청값을 자동으로 낮추지 않습니다.'}
     chosen=candidates[0]
@@ -566,7 +584,7 @@ def engine_help(exe,env=None):
     return h
 
 def help_has(h,flag):
-    return bool(re.search(r'(?<![\\w-])'+re.escape(flag)+r'(?![\\w-])',h))
+    return bool(re.search(r'(?<![\w-])'+re.escape(flag)+r'(?![\w-])',h))
 
 def compatible_args(d,args,h):
     """Only remove unsupported optional/default features; never change model placement or security."""
@@ -589,7 +607,7 @@ def supports(exe,args,env=None):
     h=engine_help(exe,env)
     missing=[]
     for a in args[1:]:
-        if a.startswith('--') and not re.search(r'(?<![\w-])'+re.escape(a)+r'(?![\w-])',h):missing.append(a)
+        if a.startswith('--') and not help_has(h,a):missing.append(a)
     if missing:raise ValueError('현재 llama.cpp 빌드가 지원하지 않는 옵션: '+', '.join(missing)+'. 최신 빌드로 업데이트하거나 해당 설정을 끄세요.')
 
 
@@ -824,6 +842,11 @@ def launch(raw):
     exe=find_server(d);f=resolve_model(d)
     if not exe:raise ValueError('llama-server를 먼저 빌드하거나 실행 파일 경로를 지정하세요.')
     files=[str(a.resolve()) for a in check_shards(f)]
+    try:md=gguf_metadata(f)['metadata']
+    except (ValueError,OSError,struct.error) as exc:
+        log('system','GGUF metadata 사전 검사 미완료: '+str(exc));md={}
+    arch=md.get('general.architecture')
+    if arch and d['profile']=='inkling2' and arch!='inkling2':raise ValueError('선택한 파일이 Inkling 2 언어 모델이 아닙니다: '+str(arch))
     if '--mmproj' in args:files.append(str(Path(args[args.index('--mmproj')+1]).resolve()))
     if d['auth'] and not read_keys():raise ValueError('API 키를 먼저 생성하세요.')
     if not e['gpu_ids']:raise ValueError('사용할 NVIDIA GPU가 없습니다.')
@@ -1110,7 +1133,7 @@ async function preview(){return guard(async()=>{let r=await api('preview',form),
 async function installBinary(){if(confirm('공식 llama.cpp GitHub 릴리스의 Windows CUDA 실행 파일 및 DLL을 다운로드하고 실행 파일 버전을 확인할까요? GPU 드라이버 호환성은 별도 확인이 필요합니다.'))await act('install_binary')}
 async function inspectLocal(){await guard(async()=>{let r=await api('inspect_local_model',form);$('localModelInspection').textContent=JSON.stringify(r,null,2)})}
 let engineRows=[], appliedBuild='';
-async function scanEngines(){await guard(async()=>{let r=await api('engines',form);engineRows=r.engines;$('engineList').innerHTML='<p>소스: '+esc(r.source.path)+'<br>Git: '+esc(r.source.branch)+' / '+esc(r.source.head||'미확인')+(r.source.dirty?' (수정됨)':'')+'</p><p>선택 중: '+esc(r.selected||'없음')+'</p>'+engineRows.map((x,i)=>'<div class="metric"><small>'+esc(x.path)+'</small><p>'+esc(x.commit||'빌드 커밋 미확인')+(x.matches?' · 현재 소스와 일치':'')+'</p><button onclick="selectEngine('+i+')">이 엔진 사용</button></div>').join('')})}
+async function scanEngines(){await guard(async()=>{let r=await api('engines',form);engineRows=r.engines;$('engineList').innerHTML='<p>소스: '+esc(r.source.path)+'<br>Git: '+esc(r.source.branch)+' / '+esc(r.source.head||'미확인')+(r.source.dirty?' (수정됨)':'')+'</p><p>선택 중: '+esc(r.selected||'없음')+'</p><pre>'+esc(r.version||'버전 미확인')+'\n'+esc(JSON.stringify(r.features||{},null,2))+'</pre>'+engineRows.map((x,i)=>'<div class="metric"><small>'+esc(x.path)+'</small><p>'+esc(x.commit||'빌드 커밋 미확인')+(x.matches?' · 현재 소스와 일치':'')+'</p><button onclick="selectEngine('+i+')">이 엔진 사용</button></div>').join('')})}
 async function selectEngine(i){if(!engineRows[i])return;form.server_exe=engineRows[i].path;render();await save();await scanEngines()}
 async function buildCurrent(){if(!confirm('현재 체크아웃을 유지하고 새 빌드 폴더에 컴파일할까요? 모델 파일은 변경하지 않습니다.'))return;await act('build_current',form)}
 function useInstalled(){let x=prev?.tasks?.build?.state==='done'?prev.tasks.build.meta?.exe:null;if(!x){toast('완료된 빌드/설치 실행 파일이 없습니다.');return}form.server_exe=x;render();save();toast('실행 파일 적용: '+x)}
