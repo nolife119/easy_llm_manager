@@ -570,6 +570,9 @@ def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
         if key in seen:continue
         seen.add(key);out.append(item)
         if len(out)>=6:break
+    if out:
+        speed=min((item for _,item in best),key=lambda x:(x['settings']['cpu_layers'],x['swa_risk'],x['rank']))
+        if speed not in out:out.append(speed)
     if out and not any(x['settings']['kv_type']=='f16' for x in out):
         f16=next((item for _,item in best if item['settings']['kv_type']=='f16'),None)
         if f16:out.append(f16)
@@ -637,8 +640,9 @@ def recommend_setup(raw):
         if near and (nearest is None or near['deficit']<nearest['deficit']):nearest=near
         if valid and not installed and quant_mode!='quality':
             downloadable.append({'quant':quant,'candidate':candidates[0],'issue':issue or '모델 다운로드 필요'})
-        if installed and valid and chosen is None:
-            chosen=candidates[0];fallbacks=candidates[1:]
+        if installed and valid:
+            if chosen is None:chosen=candidates[0];fallbacks=candidates[1:]
+            else:fallbacks.append(candidates[0])
     result={'ok':bool(chosen),'tested':tested,'models':summaries,'target_tps':target,'downloadable':downloadable[:4],
             'candidate':chosen or nearest,'alternatives':fallbacks,'hardware':{'gpus':selected,'ram_total':rt,'ram_free':rf},
             'message':'추정상 가능한 설정을 찾았습니다. 속도와 실제 초기화는 벤치마크 전까지 미검증입니다.' if chosen else '고정한 조건으로 설치된 모델의 실행 가능 후보를 찾지 못했습니다. 아래 부족량과 다운로드 후보를 확인하세요.'}
@@ -1254,6 +1258,34 @@ def record_last_ready(t,health):
             tmp.replace(LAST_READY_FILE)
         except OSError:log('system','마지막 정상 구동 설정을 디스크에 저장하지 못했습니다. 현재 세션에만 보관합니다.')
 
+def memory_detail(pid):
+    if not WIN:return {}
+    from ctypes import wintypes as W
+    out={}
+    class PMC(ctypes.Structure):
+        _fields_=[('cb',W.DWORD),('PageFaultCount',W.DWORD)]+[(k,ctypes.c_size_t) for k in ('PeakWorkingSetSize','WorkingSetSize','QuotaPeakPagedPoolUsage','QuotaPagedPoolUsage','QuotaPeakNonPagedPoolUsage','QuotaNonPagedPoolUsage','PagefileUsage','PeakPagefileUsage','PrivateUsage')]
+    class PI(ctypes.Structure):
+        _fields_=[('cb',W.DWORD)]+[(k,ctypes.c_size_t) for k in ('CommitTotal','CommitLimit','CommitPeak','PhysicalTotal','PhysicalAvailable','SystemCache','KernelTotal','KernelPaged','KernelNonpaged','PageSize')]+[(k,W.DWORD) for k in ('HandleCount','ProcessCount','ThreadCount')]
+    try:
+        psapi=ctypes.WinDLL('psapi',use_last_error=True);kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+        psapi.GetPerformanceInfo.argtypes=[ctypes.POINTER(PI),W.DWORD];psapi.GetPerformanceInfo.restype=W.BOOL
+        pi=PI();pi.cb=ctypes.sizeof(pi)
+        if psapi.GetPerformanceInfo(ctypes.byref(pi),pi.cb):
+            out.update(commit=pi.CommitTotal*pi.PageSize/GIB,commit_limit=pi.CommitLimit*pi.PageSize/GIB,system_cache=pi.SystemCache*pi.PageSize/GIB)
+        if pid:
+            kernel.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];kernel.OpenProcess.restype=W.HANDLE
+            kernel.CloseHandle.argtypes=[W.HANDLE];kernel.CloseHandle.restype=W.BOOL
+            psapi.GetProcessMemoryInfo.argtypes=[W.HANDLE,ctypes.POINTER(PMC),W.DWORD];psapi.GetProcessMemoryInfo.restype=W.BOOL
+            handle=kernel.OpenProcess(0x0400|0x0010,False,pid)
+            if handle:
+                try:
+                    m=PMC();m.cb=ctypes.sizeof(m)
+                    if psapi.GetProcessMemoryInfo(handle,ctypes.byref(m),m.cb):
+                        out.update(working_set=m.WorkingSetSize/GIB,peak_working_set=m.PeakWorkingSetSize/GIB,private_commit=m.PrivateUsage/GIB)
+                finally:kernel.CloseHandle(handle)
+    except (OSError,AttributeError,ValueError):pass
+    return out
+
 def status():
     with LOCK:
         ts={k:{x:v for x,v in t.items() if x not in ('proc','cancel')}|{'pid':t['proc'].pid if t['proc'] else None} for k,t in TASKS.items()}; logs={k:list(v) for k,v in LOGS.items()}
@@ -1271,7 +1303,7 @@ def status():
         for s in json.loads(slots):
             if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining','n_remain','n_prompt_tokens','n_prompt_tokens_processed','n_prompt_tokens_cached','n_cache_tokens') if k in s})
     except (ValueError,TypeError):pass
-    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys()),'last_ready':LAST_READY,'startup_failure':startup_failure(logs['server']) if t.get('state')=='error' else None}
+    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys()),'last_ready':LAST_READY,'memory_detail':memory_detail(t.get('pid')),'startup_failure':startup_failure(logs['server']) if t.get('state')=='error' else None}
 
 
 def save_prefs(raw):
@@ -1494,8 +1526,8 @@ function renderDashboard(s){
  $('rates').innerHTML=metric('처리 중',cnt(processing),'요청')+metric('대기 중',cnt(queued),'요청')+metric('KV 점유율',kv==null?'—':(kv*100).toFixed(1)+'%',kv==null?'엔진 미보고':'엔진 측정값')+metric('KV 저장 토큰',cnt(pk),'엔진 제공 시')+metric('최대 관측 컨텍스트',cnt(maxctx),'엔진 high watermark')+metric('설정 컨텍스트',cnt(meta.context),'슬롯당 한도 · '+cnt(meta.parallel)+' 슬롯')+metric('최근 입력 / 출력',cnt(log.promptN)+' / '+cnt(log.decodeN),'완료 로그의 처리 토큰 · 동일 요청 보장 없음')+metric('Expert cache hit',cached.hit_rate==null?'—':fmt(cached.hit_rate)+'%',cached.samples?cached.samples+'개 최근 로그 표본':'지원 로그 없음')+metric('Expert hit / miss',cached.samples?cnt(cached.hits)+' / '+cnt(cached.misses):'—',cached.samples?'CPU miss '+cnt(cached.cpu):'비활성 또는 로그 미지원')+metric('Expert 업로드',cached.samples?fmt(cached.uploaded_mib)+' MiB':'—','최근 로그 누적');
  const slots=s.slots||[];
  $('slotDisplay').innerHTML=slots.length?'<h3>슬롯별 현황</h3><table><tr><th>ID</th><th>상태</th><th>컨텍스트</th><th>입력 처리/캐시</th><th>생성</th></tr>'+slots.map(z=>'<tr><td>'+esc(z.id??'—')+'</td><td>'+esc(z.is_processing===true?'처리 중':z.is_processing===false?'유휴':'—')+'</td><td>'+cnt(z.n_past)+' / '+cnt(z.n_ctx)+'</td><td>'+cnt(z.n_prompt_tokens_processed??z.n_prompt_tokens)+' / '+cnt(z.n_prompt_tokens_cached??z.n_cache_tokens)+'</td><td>'+cnt(z.n_decoded)+'</td></tr>').join('')+'</table>':'<p>'+(meta.host==='0.0.0.0'?'공유 모드: 프롬프트 보호를 위해 슬롯 상세를 비활성화했습니다. 집계 지표는 표시합니다.':'슬롯 상세는 엔진이 제공할 때만 표시합니다.')+'</p>';
- const rt=s.ram_total,rf=s.ram_free,used=rt==null||rf==null?null:Math.max(0,rt-rf);
- $('ramCard').innerHTML=metric('시스템 RAM 사용',used==null?'—':fmt(used)+' / '+fmt(rt)+' GiB','파일 캐시와 공유 메모리 포함 가능 · 여유 '+fmt(rf)+' GiB')+(used==null?'':'<div class="bar"><i style="width:'+Math.min(100,100*used/rt)+'%"></i></div>');
+ const rt=s.ram_total,rf=s.ram_free,used=rt==null||rf==null?null:Math.max(0,rt-rf),md=s.memory_detail||{};
+ $('ramCard').innerHTML=metric('시스템 RAM 사용',used==null?'—':fmt(used)+' / '+fmt(rt)+' GiB','파일 캐시와 공유 메모리 포함 가능 · 여유 '+fmt(rf)+' GiB')+metric('llama-server Working Set',fmt(md.working_set)+' GiB','최대 '+fmt(md.peak_working_set)+' GiB · 매핑 포함')+metric('llama-server Private Commit',fmt(md.private_commit)+' GiB','프로세스 사유 커밋 (물리 RAM과 다름)')+metric('시스템 Commit',fmt(md.commit)+' / '+fmt(md.commit_limit)+' GiB','시스템 캐시 '+fmt(md.system_cache)+' GiB')+(used==null?'':'<div class="bar"><i style="width:'+Math.min(100,100*used/rt)+'%"></i></div>');
  $('errorBanner').innerHTML=st.state==='error'?'<p class="bad">실행 실패: '+esc(s.startup_failure?.message||'로그를 확인하세요.')+'</p><pre>'+esc((s.server_errors||[]).join('\n'))+'</pre><button onclick="tab(\'run\')">동일 조건의 다른 후보 검토</button>':'';
  $('metrics').textContent=s.metrics||'미지원 / 응답 없음';$('slots').textContent=JSON.stringify(slots,null,2);$('serverErrors').textContent=(s.server_errors||[]).join('\n')||'—';
  renderServerLog();setupSummary();
