@@ -1142,16 +1142,31 @@ def tune(raw):
     d,_,_=validate(raw)
     if recovery_options(d):raise ValueError('자동 튜닝 전에 복구 옵션을 비워 주세요.')
     if d['parallel']!=1 or d['unified']:raise ValueError('자동 튜닝은 단일 슬롯/비공유 KV 전용입니다.')
-    if d['mode']!='hybrid' and not raw.get('allow_gpu_tune'):raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
+    if d['mode']!='hybrid' and not raw.get('allow_gpu_tune') and not raw.get('goal_tune'):raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
     f=resolve_model(d);check_shards(f);exe=find_server(d)
     if not exe:raise ValueError('llama-server 실행 파일이 필요합니다.')
     n,m=bench_counts(raw,d['context'])
     d={**d,'host':'127.0.0.1','auth':False,'ram_cache':0}
-    plan=placement_plan(d);choices=plan['candidates']
-    if not choices:raise ValueError(plan['message'])
-    # Compare static vs several cache sizes; also test one no-CPU-share candidate.
-    variants=[dict(c['settings']) for c in choices]
-    if variants[-1]['expert_cache']:variants.append({**variants[-1],'cpu_share':0.0})
+    goal=bool(raw.get('goal_tune'));target=None
+    if goal:
+        plan=recommend_setup(raw)
+        if not plan['ok']:raise ValueError(plan['message'])
+        target=plan['target_tps']
+        n,m=bench_counts(raw,plan['settings']['context'])
+        choices=[plan['candidate'],*plan['alternatives']]
+        limit=num({'v':raw.get('trial_limit',6)},'v',1,18)
+        distinct=[];seen=set()
+        for c in choices:
+            k=c['settings']['quant']
+            if k not in seen:distinct.append(c);seen.add(k)
+        ordered=distinct+[c for c in choices if c not in distinct]
+        variants=[dict(c['settings']) for c in ordered[:limit]]
+        variants.sort(key=lambda x:BASE['model_profiles'][x['profile']]['quants'][x['quant']]['gb'],reverse=True)
+    else:
+        plan=placement_plan(d);choices=plan['candidates']
+        if not choices:raise ValueError(plan['message'])
+        variants=[dict(c['settings']) for c in choices]
+        if variants[-1]['expert_cache']:variants.append({**variants[-1],'cpu_share':0.0})
     # Keep requested context; no automatic quant/context reduction. Test only synthetic requests.
     def job():
         results=[]; best=None
@@ -1159,13 +1174,14 @@ def tune(raw):
             if TASKS['tune']['cancel']:break
             trial={**d,**variant}
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));trial['port']=sock.getsockname()[1]
-            _,e,args=command_preview(trial)
-            label=f"{i+1}/{len(variants)}: CPU {trial['cpu_layers']}층, cache {trial['expert_cache']} MiB, CPU share {trial['cpu_share']}"
+            try:_,e,args=command_preview(trial)
+            except (ValueError,OSError) as exc:log('tune','후보 설정 실패: '+str(exc));continue
+            label=f"{i+1}/{len(variants)}: {trial['quant']} / {trial['kv_type']} / {trial.get('load_mode','auto')} / CPU {trial['cpu_layers']}층, cache {trial['expert_cache']} MiB, CPU share {trial['cpu_share']}"
             log('tune',label)
             if e['danger']:
                 log('tune','메모리 재검사 실패, 후보 건너뜀: '+'; '.join(e['danger']));continue
             env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','');env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']))
-            for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
+            for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
             try:supports(str(exe),args,env)
             except ValueError as exc:log('tune',str(exc));continue
             proc=None;reader=None
@@ -1189,7 +1205,17 @@ def tune(raw):
                 second=measure_server(trial['port'],n,m,seed=124)
                 packed={**second,'cold_decode_tps':first['predicted_per_second']}
                 item=record_bench('tune',trial,packed);results.append(item)
-                if best is None or item['predicted_per_second']>best['predicted_per_second']:best=item
+                if goal:
+                    v=None
+                    if trial['vision']:
+                        try:v=vision_probe(trial['port'],False,trial['alias'])
+                        except Exception as exc:v={'accepted':False,'error':str(exc)}
+                    passed=min(first['predicted_per_second'],second['predicted_per_second'])>=target and min(first.get('predicted_n',0),second.get('predicted_n',0))>=m and (not trial['vision'] or bool(v and v.get('accepted') and v.get('correct')))
+                    item={**item,'goal_pass':passed,'goal_target':target,'vision_probe':v,'full_settings':smart_settings(trial)}
+                    results[-1]=item
+                    if passed:best=item
+                    log('tune','목표 통과' if passed else '목표 속도/비전 시험 미달')
+                elif best is None or item['predicted_per_second']>best['predicted_per_second']:best=item
                 set_task_meta('tune',results=results,best=best)
                 log('tune',f"측정 완료 | cold {first['predicted_per_second']:.2f} / warm {second['predicted_per_second']:.2f} t/s")
             except Exception as exc:
@@ -1202,8 +1228,9 @@ def tune(raw):
                 if reader:reader.join(timeout=5)
                 if proc and proc.stdout:proc.stdout.close()
                 with LOCK:TASKS['tune']['proc']=None
+            if goal and best:break
             if not TASKS['tune']['cancel']:time.sleep(2)
-        if not best and not TASKS['tune']['cancel']:raise RuntimeError('성공한 튜닝 후보가 없습니다. 로그를 확인하세요.')
+        if not best and not TASKS['tune']['cancel']:raise RuntimeError('시험한 후보 중 목표를 충족한 후보가 없습니다. 로그와 결과를 확인하세요.' if goal else '성공한 튜닝 후보가 없습니다. 로그를 확인하세요.')
         if best:log('tune','추천은 테스트한 후보와 입력 길이 기준이며 사용자가 적용하기 전에는 설정을 변경하지 않습니다.')
     start_task('tune',job)
 
@@ -1343,7 +1370,7 @@ function renderWizard(){
  if(!contexts.includes(wizardPrefs.context))wizardPrefs.context=contexts.filter(x=>x<=wizardPrefs.context).pop()||contexts[0];
  const select=(id,caption,opts,value)=>`<label class="field"><span>${caption}</span><select id="${id}">${opts.map(([v,t])=>`<option value="${esc(v)}" ${String(v)===String(value)?'selected':''}>${esc(t)}</option>`).join('')}</select></label>`;
  const slotOptions=[1,2,4,8,15,32,wizardPrefs.slots].filter((x,i,a)=>a.indexOf(x)===i).sort((a,b)=>a-b);
- $('wizard').innerHTML=`${select('wPurpose','사용 목적',[['safe','첫 실행 · 오류 확인'],['coding','개인 코딩 / 일반 대화'],['long','장문 연구 / 1M 목표'],['team','팀 공유 / 여러 사용자']],wizardPrefs.purpose)}<div class="grid">${select('wContext','슬롯당 최대 컨텍스트',contexts.map(x=>[x,x>=1048576&&x%1048576===0?(x/1048576)+'M':x%1024===0?(x/1024)+'K':x+' tokens']),wizardPrefs.context)}${wizardPrefs.purpose==='team'?select('wSlots','동시 사용자 수',slotOptions.map(x=>[x,x+'명']),wizardPrefs.slots):''}${select('wKV','활성 KV 위치',[['gpu','GPU · 빠른 응답'],['cpu','RAM · VRAM 절약']],wizardPrefs.kv)}${select('wStrategy','가중치 배치',[['auto','자동 최적화 · CPU 분산 허용'],['gpu','GPU 전체 상주만'],['static','정적 CPU Expert 분산'],['dynamic','동적 Expert 캐시 실험']],wizardPrefs.strategy)}${select('wQuantMode','모델 선택 정책',[['fixed','현재 양자화 고정'],['quality','설치 모델 중 최고 정밀도'],['all','전체 양자화 탐색 · 다운로드 후보 포함']],wizardPrefs.quantMode)}${select('wPrecision','KV 정밀도',[['auto','자동 (F16 / Q8 / Q4 탐색)'],['f16','F16 고정'],['q8_0','Q8_0 고정'],['q4_0','Q4_0 고정']],wizardPrefs.precision)}${select('wPolicy','메모리 예산',[['balanced','적응형 · 빠듯한 후보까지'],['safe','넉넉한 여유 우선']],wizardPrefs.policy)}<label class="field"><span>목표 생성 속도 (tokens/s, 실측 검증용)</span><input type="number" min="1" max="1000" step="1" id="wTarget" value="${esc(wizardPrefs.target)}"></label></div><div class="buttons"><button id="wizardApply" onclick="applyWizard()">최적 후보 계산</button></div><p id="wizardMessage">고정한 컨텍스트, Vision, 슬롯, KV 위치와 배치 방식은 변경하지 않습니다. 속도 목표는 실행 후 검증합니다.</p><div id="smartFitResult"></div>`;
+ $('wizard').innerHTML=`${select('wPurpose','사용 목적',[['safe','첫 실행 · 오류 확인'],['coding','개인 코딩 / 일반 대화'],['long','장문 연구 / 1M 목표'],['team','팀 공유 / 여러 사용자']],wizardPrefs.purpose)}<div class="grid">${select('wContext','슬롯당 최대 컨텍스트',contexts.map(x=>[x,x>=1048576&&x%1048576===0?(x/1048576)+'M':x%1024===0?(x/1024)+'K':x+' tokens']),wizardPrefs.context)}${wizardPrefs.purpose==='team'?select('wSlots','동시 사용자 수',slotOptions.map(x=>[x,x+'명']),wizardPrefs.slots):''}${select('wKV','활성 KV 위치',[['gpu','GPU · 빠른 응답'],['cpu','RAM · VRAM 절약']],wizardPrefs.kv)}${select('wStrategy','가중치 배치',[['auto','자동 최적화 · CPU 분산 허용'],['gpu','GPU 전체 상주만'],['static','정적 CPU Expert 분산'],['dynamic','동적 Expert 캐시 실험']],wizardPrefs.strategy)}${select('wQuantMode','모델 선택 정책',[['fixed','현재 양자화 고정'],['quality','설치 모델 중 최고 정밀도'],['all','전체 양자화 탐색 · 다운로드 후보 포함']],wizardPrefs.quantMode)}${select('wPrecision','KV 정밀도',[['auto','자동 (F16 / Q8 / Q4 탐색)'],['f16','F16 고정'],['q8_0','Q8_0 고정'],['q4_0','Q4_0 고정']],wizardPrefs.precision)}${select('wPolicy','메모리 예산',[['balanced','적응형 · 빠듯한 후보까지'],['safe','넉넉한 여유 우선']],wizardPrefs.policy)}<label class="field"><span>목표 생성 속도 (tokens/s, 실측 검증용)</span><input type="number" min="1" max="1000" step="1" id="wTarget" value="${esc(wizardPrefs.target)}"></label></div><div class="buttons"><button id="wizardApply" onclick="applyWizard()">최적 후보 계산</button><button onclick="runGoalTune()">실측 자동 탐색</button></div><p id="wizardMessage">고정한 컨텍스트, Vision, 슬롯, KV 위치와 배치 방식은 변경하지 않습니다. 속도 목표는 실행 후 검증합니다.</p><div id="smartFitResult"></div>`;
  const bind=(id,key,convert=x=>x)=>{let el=$(id);if(el)el.onchange=()=>{wizardPrefs[key]=convert(el.value);invalidateSmart();if(key==='purpose'){wizardPrefs.context=Math.min(p.max_context,{safe:8192,coding:32768,long:1048576,team:32768}[el.value]);renderWizard()}else $('wizardMessage').textContent='조건 변경됨 · 최적 후보를 다시 계산하세요.'}};
  bind('wPurpose','purpose');bind('wContext','context',Number);bind('wSlots','slots',Number);bind('wKV','kv');bind('wStrategy','strategy');bind('wQuantMode','quantMode');bind('wPrecision','precision');bind('wPolicy','policy');bind('wTarget','target',Number);
  $('wizardApply').disabled=wizardBusy;drawSmartFit();
@@ -1356,6 +1383,13 @@ async function applyWizard(){
  smartResult=r;smartSelected=0;if(!r.ok){smartFormSig=smartSignature();$('wizardMessage').textContent=r.message;drawSmartFit();return false}
  Object.assign(form,r.settings);smartFormSig=smartSignature();plans=[];render();$('wizardMessage').textContent=r.message;drawSmartFit();return !!(await preview());
  }catch(e){$('wizardMessage').textContent=e.message;toast(e.message);return false}finally{wizardBusy=false;$('wizardApply').disabled=false;setupSummary()}
+}
+async function runGoalTune(){
+ if(prev?.tasks?.server?.active||prev?.tasks?.tune?.active){toast('서버/튜닝 중지 후 실행하세요.');return}
+ if(wizardPrefs.purpose==='team'&&wizardPrefs.slots!==1){toast('실측 자동 탐색은 단일 슬롯만 지원합니다.');return}
+ if(!confirm('설치된 모델을 최대 6회 순차 로딩하고 합성 입력 2048 tokens (짧은 컨텍스트는 그에 맞게 제한), 출력 128 tokens를 두 번 측정하며 Vision을 시험합니다. 장시간/메모리 부족 가능성이 있습니다. 진행할까요?'))return;
+ const req={...form,goal_tune:true,trial_limit:6,bench_prompt:Math.min(2048,wizardPrefs.context-160),bench_output:128,wizard_purpose:wizardPrefs.purpose,wizard_kv:wizardPrefs.kv,wizard_strategy:wizardPrefs.strategy,wizard_context:wizardPrefs.context,wizard_slots:wizardPrefs.slots,wizard_precision:wizardPrefs.precision,wizard_policy:wizardPrefs.policy,wizard_quant_mode:wizardPrefs.quantMode,wizard_target:wizardPrefs.target};
+ await guard(async()=>{await api('tune',req);tab('tuning');poll()});
 }
 function smartSignature(){return JSON.stringify([form,wizardPrefs])}
 function invalidateSmart(){smartResult=null;smartFormSig='';if($('smartFitResult'))$('smartFitResult').innerHTML=''}
@@ -1403,8 +1437,8 @@ async function plan(){await guard(async()=>{const r=await api('plan',form);plans
 function renderPlans(msg){$('plans').innerHTML='<p>'+esc(msg)+'</p>'+ (plans.length?'<table><tr><th>후보</th><th>CPU 층 / VRAM / RAM</th><th></th></tr>'+plans.map((p,i)=>`<tr><td>${esc(p.name)}${p.swa_risk?' · SWA 위험':''}</td><td>${p.settings.cpu_layers}층 / ${fmt(p.gpu)} / ${fmt(p.ram)} GiB</td><td><button onclick="applyPlan(${i})">적용</button></td></tr>`).join('')+'</table>':'')}
 function applyPlan(i){if(!plans[i])return;Object.assign(form,plans[i].settings);render();preview()}
 async function runBench(tuning){const prompt=Number($('bench_prompt').value),out=Number($('bench_output').value);if(!Number.isInteger(prompt)||!Number.isInteger(out)){toast('정수 토큰 수를 입력하세요.');return}if(!confirm(tuning?'현재 실행 설정을 기준으로 여러 후보를 로딩해 실제 속도를 측정할까요? 다른 사용자 작업이 없어야 하며 장시간 걸릴 수 있습니다.':'실행 중 서버에 합성 테스트 요청을 보냅니다. 다른 작업이 없을 때만 진행하세요.'))return;await act(tuning?'tune':'benchmark',{...form,bench_prompt:prompt,bench_output:out});poll()}
-function applyBest(){const b=prev?.tasks?.tune?.meta?.best;if(!b){toast('성공한 자동 튜닝 결과가 없습니다.');return}const a=b.settings;if(a.profile!==form.profile||a.quant!==form.quant||a.context!==form.context||a.kv_type!==form.kv_type||a.kv_location!==form.kv_location||a.parallel!==form.parallel){toast('모델/컨텍스트/슬롯/KV 설정이 측정 조건과 다릅니다. 동일하게 맞춘 후 적용하세요.');return}Object.assign(form,{mode:a.cpu_layers?'hybrid':'gpu',cpu_layers:a.cpu_layers,expert_cache:a.expert_cache,cpu_share:a.cpu_share});render();tab('run');preview();toast('실측 후보 적용. 예상치 확인 후 시작하세요.')}
-function benchView(s){let h=s.history||[];let best=s.tasks.tune?.meta?.best;$('tuneBest').textContent=best?`가장 빠른 측정: ${fmt(best.predicted_per_second)} t/s (warm), CPU ${best.settings.cpu_layers}층 / ${best.settings.expert_cache} MiB / share ${best.settings.cpu_share}`:'아직 성공한 튜닝 결과 없음';$('history').innerHTML=h.length?'<table><tr><th>시각 / 모델</th><th>입력 · 출력</th><th>Prefill / Decode (t/s)</th><th>CPU 층 / 캐시 MiB / share</th></tr>'+h.slice().reverse().map(x=>`<tr><td>${esc(x.date)}<br>${esc(x.settings.quant)} (${esc(x.kind)})</td><td>${esc(x.requested_prompt)} / ${esc(x.requested_output)}</td><td>${fmt(x.prompt_per_second)} / ${fmt(x.predicted_per_second)}</td><td>${esc(x.settings.cpu_layers)} / ${esc(x.settings.expert_cache)} / ${esc(x.settings.cpu_share)}</td></tr>`).join('')+'</table>':'<p>아직 측정 결과가 없습니다.</p>';logs('benchmarkLog',s.logs.benchmark||[]);logs('tuneLog',s.logs.tune||[])}
+function applyBest(){const b=prev?.tasks?.tune?.meta?.best;if(!b){toast('성공한 자동 튜닝 결과가 없습니다.');return}if(b.full_settings){if(!confirm('목표 통과 실측 후보를 적용할까요? 현재 접속 및 인증 설정은 유지합니다.'))return;Object.assign(form,b.full_settings);wizardPrefs=null;invalidateSmart();render();tab('run');preview();return}const a=b.settings;if(a.profile!==form.profile||a.quant!==form.quant||a.context!==form.context||a.kv_type!==form.kv_type||a.kv_location!==form.kv_location||a.parallel!==form.parallel){toast('모델/컨텍스트/슬롯/KV 설정이 측정 조건과 다릅니다. 동일하게 맞춘 후 적용하세요.');return}Object.assign(form,{mode:a.cpu_layers?'hybrid':'gpu',cpu_layers:a.cpu_layers,expert_cache:a.expert_cache,cpu_share:a.cpu_share});render();tab('run');preview();toast('실측 후보 적용. 예상치 확인 후 시작하세요.')}
+function benchView(s){let h=s.history||[];let best=s.tasks.tune?.meta?.best;$('tuneBest').textContent=best?.goal_pass?`목표 통과: ${best.settings.quant} · ${fmt(best.cold_decode_tps)} / ${fmt(best.predicted_per_second)} t/s · 목표 ${best.goal_target} t/s`:best?`가장 빠른 측정: ${fmt(best.predicted_per_second)} t/s (warm), CPU ${best.settings.cpu_layers}층 / ${best.settings.expert_cache} MiB / share ${best.settings.cpu_share}`:'아직 성공한 튜닝 결과 없음';$('history').innerHTML=h.length?'<table><tr><th>시각 / 모델</th><th>입력 · 출력</th><th>Prefill / Decode (t/s)</th><th>CPU 층 / 캐시 MiB / share</th></tr>'+h.slice().reverse().map(x=>`<tr><td>${esc(x.date)}<br>${esc(x.settings.quant)} (${esc(x.kind)})</td><td>${esc(x.requested_prompt)} / ${esc(x.requested_output)}</td><td>${fmt(x.prompt_per_second)} / ${fmt(x.predicted_per_second)}</td><td>${esc(x.settings.cpu_layers)} / ${esc(x.settings.expert_cache)} / ${esc(x.settings.cpu_share)}</td></tr>`).join('')+'</table>':'<p>아직 측정 결과가 없습니다.</p>';logs('benchmarkLog',s.logs.benchmark||[]);logs('tuneLog',s.logs.tune||[])}
 
 let starting=false,restarting=false;
 async function startServer(){
