@@ -1140,17 +1140,19 @@ def benchmark(raw):
 def tune(raw):
     if any(task_busy(k) for k in ('build','download','server','benchmark','tune')):raise ValueError('다른 작업을 중지한 뒤 튜닝하세요.')
     d,_,_=validate(raw)
+    goal=bool(raw.get('goal_tune'))
     if recovery_options(d):raise ValueError('자동 튜닝 전에 복구 옵션을 비워 주세요.')
-    if d['parallel']!=1 or d['unified']:raise ValueError('자동 튜닝은 단일 슬롯/비공유 KV 전용입니다.')
+    if not goal and (d['parallel']!=1 or d['unified']):raise ValueError('자동 튜닝은 단일 슬롯/비공유 KV 전용입니다.')
     if d['mode']!='hybrid' and not raw.get('allow_gpu_tune') and not raw.get('goal_tune'):raise ValueError('GPU + CPU MoE 모드에서 실행하세요.')
-    f=resolve_model(d);check_shards(f);exe=find_server(d)
+    exe=find_server(d)
     if not exe:raise ValueError('llama-server 실행 파일이 필요합니다.')
-    n,m=bench_counts(raw,d['context'])
+    if not goal:check_shards(resolve_model(d))
     d={**d,'host':'127.0.0.1','auth':False,'ram_cache':0}
-    goal=bool(raw.get('goal_tune'));target=None
+    target=None
     if goal:
         plan=recommend_setup(raw)
         if not plan['ok']:raise ValueError(plan['message'])
+        if plan['settings']['parallel']!=1:raise ValueError('실측 자동 탐색은 단일 슬롯 전용입니다.')
         target=plan['target_tps']
         n,m=bench_counts(raw,plan['settings']['context'])
         choices=[plan['candidate'],*plan['alternatives']]
@@ -1163,6 +1165,7 @@ def tune(raw):
         variants=[dict(c['settings']) for c in ordered[:limit]]
         variants.sort(key=lambda x:BASE['model_profiles'][x['profile']]['quants'][x['quant']]['gb'],reverse=True)
     else:
+        n,m=bench_counts(raw,d['context'])
         plan=placement_plan(d);choices=plan['candidates']
         if not choices:raise ValueError(plan['message'])
         variants=[dict(c['settings']) for c in choices]
@@ -1377,7 +1380,7 @@ function renderWizard(){
 }
 async function applyWizard(){
  if(wizardBusy)return false;wizardBusy=true;$('wizardApply').disabled=true;$('smartStart').disabled=true;$('wizardMessage').textContent='GPU/RAM 여유 공간으로 계산 중…';
- const signature=JSON.stringify([form,wizardPrefs]);
+ const signature=JSON.stringify([form,wizardPrefs]);invalidateSmart();
  try{let r=await api('recommend',{...form,wizard_purpose:wizardPrefs.purpose,wizard_kv:wizardPrefs.kv,wizard_strategy:wizardPrefs.strategy,wizard_context:wizardPrefs.context,wizard_slots:wizardPrefs.slots,wizard_precision:wizardPrefs.precision,wizard_policy:wizardPrefs.policy,wizard_quant_mode:wizardPrefs.quantMode,wizard_target:wizardPrefs.target});
  if(signature!==JSON.stringify([form,wizardPrefs]))throw Error('계산 중 설정 변경됨. 다시 계산하세요.');
  smartResult=r;smartSelected=0;if(!r.ok){smartFormSig=smartSignature();$('wizardMessage').textContent=r.message;drawSmartFit();return false}
@@ -1402,13 +1405,13 @@ function drawSmartFit(){
  let html='<div class="panel" style="padding:12px;margin-top:12px"><h3>최적화 결과 · '+esc(r.tested||0)+'개 설정 검토</h3><p>'+esc(r.message)+'</p>';
  if(current){
   let k=current.settings;
-  html+='<p class="'+(r.ok?'good':'bad')+'">'+esc(r.ok?'추정 적합 후보':'가장 가까운 추정 후보 (실행 불가)')+' · '+esc(k.quant)+' · '+esc(k.kv_type)+' · CPU '+k.cpu_layers+'층 · Batch '+k.batch+'/'+k.ubatch+'</p>';
+  html+='<p class="'+(r.ok?'good':'bad')+'">'+esc(r.ok?'추정 적합 후보':'가장 가까운 추정 후보 (실행 불가)')+' · '+esc(k.quant)+' · '+esc(k.kv_type)+' · '+esc(k.load_mode||'auto')+' · CPU '+k.cpu_layers+'층 · Batch '+k.batch+'/'+k.ubatch+'</p>';
   html+='<table><tbody><tr><td>GPU 모델 가중치</td><td>'+gb(current.gpu_weight)+'</td></tr><tr><td>활성 KV ('+esc(k.kv_location)+')</td><td>'+gb(current.kv)+'</td></tr><tr><td>Expert cache / Vision</td><td>'+gb(k.expert_cache/1024)+' / '+gb(current.vision_reserve)+'</td></tr><tr><td>GPU 연산/여유 예산</td><td>'+gb(current.runtime_reserve)+'</td></tr><tr><td>GPU 필요 / 가용</td><td>'+gb(current.gpu)+' / '+gb(current.gpu_free)+'</td></tr><tr><td>GPU 차이</td><td class="'+(current.gpu_gap<0?'bad':'good')+'">'+gap(current.gpu_gap)+'</td></tr><tr><td>CPU 모델 가중치</td><td>'+gb(current.cpu_weight)+'</td></tr><tr><td>RAM 필요 / 가용</td><td>'+gb(current.ram)+' / '+gb(current.ram_free)+'</td></tr><tr><td>Windows 파일 상주 추가 위험</td><td>'+gb(current.mapped_extra_risk)+'</td></tr><tr><td>RAM 파일 상주 포함 시 (추정)</td><td>'+gb(current.host_peak_risk)+'</td></tr><tr><td>RAM 차이</td><td class="'+(current.ram_gap<0?'bad':'good')+'">'+gap(current.ram_gap)+'</td></tr><tr><td>SWA 전체 할당 시 KV</td><td>'+gb(current.kv_worst)+'</td></tr></tbody></table>';
   html+='<p>'+current.per_gpu.map(g=>'GPU '+g.id+': '+gb(g.need)+' / '+gb(g.free)+' ('+gap(g.gap)+')').join(' · ')+'</p>';
   if(current.swa_risk)html+='<p class="warn">SWA 전체 할당 방식이면 부족할 수 있습니다. 런타임 초기화 결과가 우선입니다.</p>';
   if(current.danger?.length)html+=current.danger.map(x=>'<p class="bad">'+esc(x)+'</p>').join('');
  }
- if(choices.length){html+='<h3>동일 요구의 다른 후보</h3>'+choices.map((x,i)=>'<div class="metric" style="margin:5px 0"><p>'+esc(x.settings.kv_type.toUpperCase())+' · '+esc(x.settings.load_mode||'auto')+' · CPU '+x.settings.cpu_layers+'층 · Batch '+x.settings.batch+'/'+x.settings.ubatch+' · GPU '+gap(x.gpu_gap)+'</p><button '+(i===smartSelected?'disabled ':'')+'onclick="chooseSmart('+i+')">'+(i===smartSelected?'현재 적용됨':'이 후보 적용')+'</button></div>').join('')}
+ if(choices.length){html+='<h3>동일 요구의 다른 후보</h3>'+choices.map((x,i)=>'<div class="metric" style="margin:5px 0"><p>'+esc(x.settings.quant)+' · '+esc(x.settings.kv_type.toUpperCase())+' · '+esc(x.settings.load_mode||'auto')+' · CPU '+x.settings.cpu_layers+'층 · Batch '+x.settings.batch+'/'+x.settings.ubatch+' · GPU '+gap(x.gpu_gap)+'</p><button '+(i===smartSelected?'disabled ':'')+'onclick="chooseSmart('+i+')">'+(i===smartSelected?'현재 적용됨':'이 후보 적용')+'</button></div>').join('')}
  if(r.models?.length){html+='<details '+(!r.ok?'open':'')+'><summary>양자화별 비교</summary><table><tr><th>모델</th><th>파일</th><th>추정</th></tr>'+r.models.map(x=>'<tr><td>'+esc(x.quant)+'</td><td>'+esc(x.installed?'설치됨':x.issue||'다운로드 필요')+'</td><td>'+esc(x.feasible?'적합':x.deficit==null?'미지원':gb(x.deficit)+' 부족')+'</td></tr>').join('')+'</table></details>'}
  if(r.downloadable?.length){html+='<p>다운로드 가능한 더 큰 모델 후보: '+r.downloadable.map(x=>esc(x.quant)).join(', ')+'. 모델 파일을 자동으로 다운로드하지 않습니다.</p>'}
  html+='<p class="mini-note">추정 예산은 실제 VRAM 배치가 아닙니다. 속도 '+esc(r.target_tps??wizardPrefs.target)+' t/s는 실행 후 모니터의 목표 검증 버튼으로 확인하세요.</p></div>';
