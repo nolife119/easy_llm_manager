@@ -379,6 +379,7 @@ def validate(d):
     if d['mode'] not in ('gpu','hybrid') or d['kv_location'] not in ('gpu','cpu') or d['kv_type'] not in ('f16','q8_0','q4_0'):raise ValueError('지원하지 않는 모드입니다.')
     if d['host'] not in ('127.0.0.1','0.0.0.0'):raise ValueError('지원하는 호스트: 127.0.0.1 / 0.0.0.0')
     if d['reasoning'] not in ('none','minimal','low','medium','high','xhigh','max'):raise ValueError('reasoning 설정 오류')
+    if d.get('load_mode','auto') not in ('auto','mmap','none'):raise ValueError('모델 로딩 방식 오류')
     if d['mode']=='gpu':d['cpu_layers']=0;d['expert_cache']=0;d['cpu_share']=0
     if d['cpu_layers']==0 and d['expert_cache']:raise ValueError('Expert 캐시는 CPU Expert가 있어야 합니다.')
     if d['cpu_share'] and not d['expert_cache']:raise ValueError('CPU share는 Expert 캐시가 있어야 합니다.')
@@ -412,6 +413,10 @@ def estimate(raw,hardware=None,weight_override=None,fast=False):
     gpu=weight-cpu+expert+(kv if d['kv_location']=='gpu' else 0)+d['runtime_reserve']+(2 if d['vision'] else 0)
     # mmap may also keep file pages in RAM, reclaimable; this is mandatory-ish budget, not physical RSS guarantee.
     host=cpu+(kv if d['kv_location']=='cpu' else 0)+d['ram_cache']/1024+d['ram_reserve']
+    load_mode=d.get('load_mode','auto')
+    # Windows mapped GPU pages may remain resident. Keep separate peak-risk budgets, not a fabricated exact RSS.
+    mapped_extra=weight-cpu if WIN and load_mode in ('auto','mmap') and recovery_options(d).get('--no-mmap') is not True else 0
+    host_peak=host+mapped_extra
     vfree=sum(g['free'] for g in gs); vtotal=sum(g['total'] for g in gs)
     if not gs:danger.append('NVIDIA GPU 정보를 읽지 못했습니다. CUDA/드라이버 및 GPU 번호를 확인하세요.')
     elif gpu>vfree:danger.append(f'예상 VRAM {gpu:.1f} GiB > 현재 여유 {vfree:.1f} GiB')
@@ -431,9 +436,10 @@ def estimate(raw,hardware=None,weight_override=None,fast=False):
     if d['kv_type']!='f16':warnings.append('양자화 KV 및 Flash Attention의 모델/빌드 호환성을 실행 시 검증해야 합니다.')
     if d['host']=='0.0.0.0' and not d['auth']:danger.append('사내망 접속에는 API 키가 필수입니다. 인증을 켜세요.')
     if d['ram_cache']:warnings.append('RAM prompt cache는 유휴/재사용 캐시입니다. 활성 KV 전체를 대체하지 않습니다. 다중 사용자 격리를 검증하세요.')
+    if mapped_extra and rf is not None and host_peak>rf:warnings.append(f'Windows mmap 상주 위험: RAM 필요 추정 {host:.1f} GiB, 파일 페이지 포함 시 {host_peak:.1f} GiB > 여유 {rf:.1f} GiB. 직접 읽기 방식도 별도 검증하세요.')
     if d['context']>=262144:warnings.append('긴 컨텍스트는 prefill 시간, 추가 상태 및 체크포인트 메모리를 크게 증가시킬 수 있습니다.')
     warnings.append('가중치 배치/Expert 비율 및 SWA는 추정치입니다. 프로젝트 파일, CUDA 버퍼, mmap, GPU별 레이어 불균형에 따라 실측이 달라집니다.')
-    return {'weight':weight,'gpu_weight':weight-cpu,'cpu_weight':cpu,'kv':kv,'kv_worst':worst,'gpu':gpu,'host_ram':host,'vfree':vfree,'vtotal':vtotal,'ram_free':rf,'ram_total':rt,'gpu_allocation':per,'ratios':ratios,'gpu_ids':[g['index'] for g in gs],'pool':d['pool'],'warnings':warnings,'danger':danger,'model':str(f or ''),'archive_free':None if fast else disk(repo_path(d)).get('free')}
+    return {'weight':weight,'gpu_weight':weight-cpu,'cpu_weight':cpu,'kv':kv,'kv_worst':worst,'gpu':gpu,'host_ram':host,'host_peak_risk':host_peak,'mapped_extra_risk':mapped_extra,'load_mode':load_mode,'vfree':vfree,'vtotal':vtotal,'ram_free':rf,'ram_total':rt,'gpu_allocation':per,'ratios':ratios,'gpu_ids':[g['index'] for g in gs],'pool':d['pool'],'warnings':warnings,'danger':danger,'model':str(f or ''),'archive_free':None if fast else disk(repo_path(d)).get('free')}
 
 
 def placement_plan(raw):
@@ -502,7 +508,7 @@ def apply_recovery(args,opts):
             if v is not True:args.append(v)
     return args
 
-SMART_KEYS=('profile','quant','model_path','context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split')
+SMART_KEYS=('profile','quant','model_path','context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split','load_mode')
 def smart_settings(d):
     return {k:d[k] for k in SMART_KEYS}
 
@@ -546,10 +552,10 @@ def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
                               'gpu_weight':e['gpu_weight'],'cpu_weight':e['cpu_weight'],'kv':e['kv'],'kv_worst':e['kv_worst'],
                               'gpu_free':e['vfree'],'ram_free':rf,'gpu_gap':vg,'ram_gap':rg,'swa_risk':swa_risk,
                               'deficit':deficit,'per_gpu':[{'id':g['index'],'free':g['free'],'need':v,'gap':g['free']-v} for g,v in zip(gs,e['gpu_allocation'])],
-                              'warnings':e['warnings'],'danger':e['danger'],'runtime_reserve':reserve,'ram_reserve':host,
+                              'warnings':e['warnings'],'danger':e['danger'],'host_peak_risk':e['host_peak_risk'],'mapped_extra_risk':e['mapped_extra_risk'],'runtime_reserve':reserve,'ram_reserve':host,
                               'vision_reserve':2 if d['vision'] else 0,'rank':[]}
                         # Prefer avoiding uncertain full-SWA allocation failures, CPU offload, low KV precision, and then tight buffers.
-                        rank=(int(swa_risk),n,types.index(kt),ri,hi,-cache)
+                        rank=(int(swa_risk),int(e['host_peak_risk']>rf),n,types.index(kt),ri,hi,-cache)
                         item['rank']=list(rank)
                         key=(deficit,)+rank
                         if nearest is None or key<nearest[0]:nearest=(key,item)
@@ -588,7 +594,7 @@ def recommend_setup(raw):
     d={**BASE['defaults'],**raw,'purpose':purpose,'context':desired,'parallel':slots,'unified':False,'pool':desired*slots,
        'mode':'gpu','cpu_layers':0,'expert_cache':0,'cpu_share':0,'expert_verbose':False,'kv_location':location,
        'kv_type':'f16','ram_cache':0,'runtime_reserve':8,'ram_reserve':8,'batch':256,'ubatch':128,
-       'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False))}
+       'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False)),'load_mode':raw.get('load_mode','auto')}
     # Keep explicitly selected GPUs and split; do not silently switch devices.
     selected=selected_gpus(d,gs)
     if not selected or any(g['free']<=0 for g in selected):return {'ok':False,'message':'선택 GPU에 여유 VRAM이 없습니다.'}
@@ -597,7 +603,8 @@ def recommend_setup(raw):
     env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
     h=engine_help(str(exe),env)
     caps={'cpu':help_has(h,'--n-cpu-moe'),'dynamic':all(help_has(h,k) for k in ('--moe-cache-mib','--moe-cache-cpu-share','--n-cpu-moe')),
-          'quant_kv':all(help_has(h,k) for k in ('--cache-type-k','--cache-type-v','--flash-attn'))}
+          'quant_kv':all(help_has(h,k) for k in ('--cache-type-k','--cache-type-v','--flash-attn')),
+          'direct_load':help_has(h,'--load-mode') or help_has(h,'--no-mmap')}
     if d['vision'] and not help_has(h,'--mmproj'):return {'ok':False,'message':'선택 엔진은 Vision projector 옵션을 지원하지 않습니다.'}
     if strategy=='dynamic' and not caps['dynamic']:return {'ok':False,'message':'선택 엔진에 동적 Expert 캐시 옵션이 없습니다. 정적 또는 GPU 배치를 선택하세요.'}
     if strategy=='static' and not caps['cpu']:return {'ok':False,'message':'선택 엔진은 CPU Expert 분산 옵션을 지원하지 않습니다.'}
@@ -618,6 +625,11 @@ def recommend_setup(raw):
             paths_to_check=([repo_path(trial)/projector,f.parent/projector,f.parent.parent/projector] if f and projector else [repo_path(trial)/projector] if projector else [])
             if not any(x.is_file() for x in paths_to_check):installed=False;issue='Vision projector가 없습니다.'
         candidates,near,count=smart_search(trial,p,weight,hardware,strategy,precision,policy,caps);tested+=count
+        if WIN and caps['direct_load'] and trial['load_mode']=='auto' and weight<rf and not any(k in opts for k in ('--mmap','--no-mmap')):
+            direct,near_direct,n_direct=smart_search({**trial,'load_mode':'none'},p,weight,hardware,strategy,precision,policy,caps);tested+=n_direct
+            # Keep both loading modes. Direct reading may lower resident file pages, but peak RAM is unverified.
+            if direct:candidates=sorted(candidates[:4]+direct[:4],key=lambda x:x['rank'])
+            if near_direct and (near is None or near_direct['deficit']<near['deficit']):near=near_direct
         valid=bool(candidates)
         summary={'quant':quant,'installed':installed,'feasible':valid,'issue':issue,'weight':weight,
                  'deficit':near['deficit'] if near else None,'gpu_gap':near['gpu_gap'] if near else None,'ram_gap':near['ram_gap'] if near else None}
@@ -665,6 +677,13 @@ def command_preview(raw):
     if exe and exe.is_file():
         env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
         h=engine_help(str(exe),env)
+        mode=d.get('load_mode','auto')
+        if mode!='auto':
+            if any(k in opts for k in ('--mmap','--no-mmap')):raise ValueError('모델 로딩 방식과 복구 mmap 옵션을 동시에 지정하지 마세요.')
+            if help_has(h,'--load-mode'):args+=['--load-mode',mode]
+            elif help_has(h,'--no-mmap') and mode=='none':args+=['--no-mmap']
+            elif help_has(h,'--mmap') and mode=='mmap':args+=['--mmap']
+            else:raise ValueError('선택 엔진에서 지정한 모델 로딩 방식 미지원')
         args,notes=compatible_args(d,args,h);e['warnings'].extend(notes)
         missing=[a for a in args[1:] if a.startswith('--') and not help_has(h,a)]
         if missing:e['warnings'].append('필수/명시 옵션 미지원 (실행 전 해결 필요): '+', '.join(missing))
@@ -1281,7 +1300,7 @@ function field(k,label,type='text',choices=null,help=''){let v=form[k]??'';let i
 function wire(){document.querySelectorAll('[data-k]').forEach(el=>el.onchange=()=>{const k=el.dataset.k;form[k]=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value;invalidateSmart();if(k==='host'&&form.host==='0.0.0.0'){form.auth=true;render();return}plans=[];if($('plans'))$('plans').textContent='설정 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='profile'){form.quant=Object.keys(config.model_profiles[form.profile].quants)[0];form.model_path='';render()}else if(k==='quant'){form.model_path='';render()}else{document.querySelectorAll(`[data-k="${k}"]`).forEach(x=>{if(x!==el){if(x.type==='checkbox')x.checked=form[k];else x.value=form[k]}});connection();setupSummary()}})}
 function downloadForm(){return {...form,...dl,model_path:''}}
 function renderDownload(){const p=config.model_profiles[dl.profile],q=p.quants[dl.quant];$('modelFields').innerHTML=`<label class="field"><span>다운로드 모델 계열</span><select id="dlProfile">${Object.entries(config.model_profiles).map(([k,v])=>`<option value="${esc(k)}" ${k===dl.profile?'selected':''}>${esc(v.label)}</option>`).join('')}</select></label><label class="field"><span>다운로드 양자화</span><select id="dlQuant">${Object.entries(p.quants).map(([k,v])=>`<option value="${esc(k)}" ${k===dl.quant?'selected':''}>${esc(k)} · ${v.gb} GB</option>`).join('')}</select></label><label class="check"><input type="checkbox" id="dlVision" ${dl.vision?'checked':''}>Vision projector 포함</label>`;$('dlProfile').onchange=()=>{dl.profile=$('dlProfile').value;dl.quant=Object.keys(config.model_profiles[dl.profile].quants)[0];renderDownload()};$('dlQuant').onchange=()=>{dl.quant=$('dlQuant').value;renderDownload()};$('dlVision').onchange=()=>{dl.vision=$('dlVision').checked};$('modelSpec').innerHTML=`<div class="grid">${metric('파일 용량',q.gb+' GB',fmt(q.gb*1e9/1073741824)+' GiB')}${metric('원본 top-token 일치율',q.agreement==null?'—':q.agreement+'%','품질 벤치마크 점수 아님')}</div>`}
-function clearRecovery(){form.recovery_options='';$('recovery').value='';preview()}
+function clearRecovery(){invalidateSmart();form.recovery_options='';$('recovery').value='';preview()}
 async function runDiagnostic(){await guard(async()=>{const r=await api('diagnostic_command',{...form,diagnostic:$('diagCommand').value});$('diagOutput').textContent=r.command+'\nexit '+r.code+'\n'+r.output})}
 function models(){let p=config.model_profiles[form.profile];return field('profile','모델 계열','select',Object.entries(config.model_profiles).map(([k,v])=>[k,v.label]))+field('quant','양자화','select',Object.entries(p.quants).map(([k,v])=>[k,`${k} · ${v.gb} GB`]))+field('vision','Vision projector 포함','check')}
 let wizardPrefs=null,wizardBusy=false,smartResult=null,smartFormSig="",smartSelected=0;
@@ -1318,12 +1337,12 @@ function drawSmartFit(){
  if(current){
   let k=current.settings;
   html+='<p class="'+(r.ok?'good':'bad')+'">'+esc(r.ok?'추정 적합 후보':'가장 가까운 추정 후보 (실행 불가)')+' · '+esc(k.quant)+' · '+esc(k.kv_type)+' · CPU '+k.cpu_layers+'층 · Batch '+k.batch+'/'+k.ubatch+'</p>';
-  html+='<table><tbody><tr><td>GPU 모델 가중치</td><td>'+gb(current.gpu_weight)+'</td></tr><tr><td>활성 KV ('+esc(k.kv_location)+')</td><td>'+gb(current.kv)+'</td></tr><tr><td>Expert cache / Vision</td><td>'+gb(k.expert_cache/1024)+' / '+gb(current.vision_reserve)+'</td></tr><tr><td>GPU 연산/여유 예산</td><td>'+gb(current.runtime_reserve)+'</td></tr><tr><td>GPU 필요 / 가용</td><td>'+gb(current.gpu)+' / '+gb(current.gpu_free)+'</td></tr><tr><td>GPU 차이</td><td class="'+(current.gpu_gap<0?'bad':'good')+'">'+gap(current.gpu_gap)+'</td></tr><tr><td>CPU 모델 가중치</td><td>'+gb(current.cpu_weight)+'</td></tr><tr><td>RAM 필요 / 가용</td><td>'+gb(current.ram)+' / '+gb(current.ram_free)+'</td></tr><tr><td>RAM 차이</td><td class="'+(current.ram_gap<0?'bad':'good')+'">'+gap(current.ram_gap)+'</td></tr><tr><td>SWA 전체 할당 시 KV</td><td>'+gb(current.kv_worst)+'</td></tr></tbody></table>';
+  html+='<table><tbody><tr><td>GPU 모델 가중치</td><td>'+gb(current.gpu_weight)+'</td></tr><tr><td>활성 KV ('+esc(k.kv_location)+')</td><td>'+gb(current.kv)+'</td></tr><tr><td>Expert cache / Vision</td><td>'+gb(k.expert_cache/1024)+' / '+gb(current.vision_reserve)+'</td></tr><tr><td>GPU 연산/여유 예산</td><td>'+gb(current.runtime_reserve)+'</td></tr><tr><td>GPU 필요 / 가용</td><td>'+gb(current.gpu)+' / '+gb(current.gpu_free)+'</td></tr><tr><td>GPU 차이</td><td class="'+(current.gpu_gap<0?'bad':'good')+'">'+gap(current.gpu_gap)+'</td></tr><tr><td>CPU 모델 가중치</td><td>'+gb(current.cpu_weight)+'</td></tr><tr><td>RAM 필요 / 가용</td><td>'+gb(current.ram)+' / '+gb(current.ram_free)+'</td></tr><tr><td>Windows 파일 상주 추가 위험</td><td>'+gb(current.mapped_extra_risk)+'</td></tr><tr><td>RAM 파일 상주 포함 시 (추정)</td><td>'+gb(current.host_peak_risk)+'</td></tr><tr><td>RAM 차이</td><td class="'+(current.ram_gap<0?'bad':'good')+'">'+gap(current.ram_gap)+'</td></tr><tr><td>SWA 전체 할당 시 KV</td><td>'+gb(current.kv_worst)+'</td></tr></tbody></table>';
   html+='<p>'+current.per_gpu.map(g=>'GPU '+g.id+': '+gb(g.need)+' / '+gb(g.free)+' ('+gap(g.gap)+')').join(' · ')+'</p>';
   if(current.swa_risk)html+='<p class="warn">SWA 전체 할당 방식이면 부족할 수 있습니다. 런타임 초기화 결과가 우선입니다.</p>';
   if(current.danger?.length)html+=current.danger.map(x=>'<p class="bad">'+esc(x)+'</p>').join('');
  }
- if(choices.length){html+='<h3>동일 요구의 다른 후보</h3>'+choices.map((x,i)=>'<div class="metric" style="margin:5px 0"><p>'+esc(x.settings.kv_type.toUpperCase())+' · CPU '+x.settings.cpu_layers+'층 · Batch '+x.settings.batch+'/'+x.settings.ubatch+' · GPU '+gap(x.gpu_gap)+'</p><button '+(i===smartSelected?'disabled ':'')+'onclick="chooseSmart('+i+')">'+(i===smartSelected?'현재 적용됨':'이 후보 적용')+'</button></div>').join('')}
+ if(choices.length){html+='<h3>동일 요구의 다른 후보</h3>'+choices.map((x,i)=>'<div class="metric" style="margin:5px 0"><p>'+esc(x.settings.kv_type.toUpperCase())+' · '+esc(x.settings.load_mode||'auto')+' · CPU '+x.settings.cpu_layers+'층 · Batch '+x.settings.batch+'/'+x.settings.ubatch+' · GPU '+gap(x.gpu_gap)+'</p><button '+(i===smartSelected?'disabled ':'')+'onclick="chooseSmart('+i+')">'+(i===smartSelected?'현재 적용됨':'이 후보 적용')+'</button></div>').join('')}
  if(r.models?.length){html+='<details '+(!r.ok?'open':'')+'><summary>양자화별 비교</summary><table><tr><th>모델</th><th>파일</th><th>추정</th></tr>'+r.models.map(x=>'<tr><td>'+esc(x.quant)+'</td><td>'+esc(x.installed?'설치됨':x.issue||'다운로드 필요')+'</td><td>'+esc(x.feasible?'적합':x.deficit==null?'미지원':gb(x.deficit)+' 부족')+'</td></tr>').join('')+'</table></details>'}
  if(r.downloadable?.length){html+='<p>다운로드 가능한 더 큰 모델 후보: '+r.downloadable.map(x=>esc(x.quant)).join(', ')+'. 모델 파일을 자동으로 다운로드하지 않습니다.</p>'}
  html+='<p class="mini-note">추정 예산은 실제 VRAM 배치가 아닙니다. 속도 '+esc(r.target_tps??wizardPrefs.target)+' t/s는 실행 후 모니터의 목표 검증 버튼으로 확인하세요.</p></div>';
@@ -1331,8 +1350,8 @@ function drawSmartFit(){
 }
 async function chooseSmart(i){if(!smartResult?.ok||smartFormSig!==smartSignature()||prev?.tasks?.server?.active)return;const choices=[smartResult.candidate,...smartResult.alternatives];if(!choices[i])return;Object.assign(form,choices[i].settings);smartSelected=i;smartFormSig=smartSignature();render();await preview()}
 async function wizardStart(){if(prev?.tasks?.server?.active){toast('현재 서버를 중지한 뒤 실행하세요.');return}if(!await preflightKeys())return;if(smartResult?.ok&&smartFormSig===smartSignature()){await startServer();return}if(await applyWizard())await startServer()}
-function render(){renderWizard();let p=config.model_profiles[form.profile],q=p.quants[form.quant];$('pathFields').innerHTML=field('workspace','작업 폴더')+field('llama_dir','llama.cpp 소스 폴더','text',null,'비워 두면 작업폴더/llama.cpp')+field('model_dir','모델 폴더','text',null,'비워 두면 작업폴더/models')+field('server_exe','기존 llama-server.exe 직접 지정','text',null,'비워 두면 자동 탐색');renderDownload();$('runModel').innerHTML=models()+field('model_path','첫 GGUF 파일 직접 지정 (선택)','text',null,'자동 감지에 실패했거나 기존 다운로드를 사용하려면 지정');$('runtimeFields').innerHTML=field('runtime_cuda','공식 바이너리 CUDA','select',[['12','CUDA 12 (구형 드라이버 우선 확인)'],['13','CUDA 13 (신형 드라이버)']])+field('runtime_tag','공식 릴리스 태그 (선택)','text',null,'비워 두면 최근 안정 릴리스 중 DLL 쌍 탐색');$('buildFields').innerHTML=field('cuda_root','CUDA Toolkit 폴더 (선택)','text',null,'비워 두면 설치된 최신 nvcc 탐색; v12.2 등 전체 경로 지정 가능')+field('cuda_arch','CUDA Architecture')+field('build_jobs','병렬 빌드 작업 수','number')+field('llama_ref','Git ref / 태그 / 커밋 (선택)','text',null,'비워 두면 현재 소스 유지, 최초 clone은 기본 브랜치');$('placement').innerHTML=field('mode','가중치 모드','select',[['gpu','GPU 전체 상주'],['hybrid','GPU + CPU MoE']])+field('cpu_layers','CPU MoE 레이어 수','number',null,'앞 N개 레이어 Expert만 RAM에 저장')+field('expert_cache','동적 GPU Expert cache (MiB)','number',null,'0 = 끔 / 최신 빌드 기능')+field('cpu_share','캐시 miss CPU 연산 비율 (0~1)','number')+field('expert_verbose','Expert 캐시 상세 로그 (디버그)','check')+field('gpu_ids','GPU 번호 (예: 0,1)','text',null,'비워 두면 모든 GPU')+field('split','GPU 배치 비율 (예: 1,1)','text',null,'비워 두면 여유 VRAM 비례');$('contexts').innerHTML=field('context','슬롯당 최대 컨텍스트','number')+field('parallel','동시 슬롯 수','number')+field('unified','공유 KV 풀 사용','check')+field('pool','전체 공유 KV 풀 토큰','number',null,'공유 모드에서만 사용')+field('kv_location','활성 KV 위치','select',[['gpu','GPU (권장)'],['cpu','RAM / CPU (느릴 수 있음)']])+field('kv_type','KV 정밀도','select',[['f16','FP16 (호환성 우선)'],['q8_0','Q8_0'],['q4_0','Q4_0 (실험)']])+field('ram_cache','RAM prompt cache 상한 (MiB)','number',null,'0 = 끔; 유휴 슬롯/프롬프트 보관')+field('runtime_reserve','GPU 기타 여유 공간 (GiB)','number')+field('ram_reserve','RAM 기타 여유 공간 (GiB)','number');$('advanced').innerHTML=field('batch','logical batch','number')+field('ubatch','physical ubatch','number')+field('threads','CPU 연산 스레드','number')+field('reasoning','Reasoning effort','select',['none','minimal','low','medium','high','xhigh','max'].map(x=>[x,x]))+field('alias','API 모델 이름');$('networkFields').innerHTML=field('host','접속 범위','select',[['127.0.0.1','이 서버에서만 (localhost)'],['0.0.0.0','승인된 사내망의 다른 PC (0.0.0.0)']])+field('port','API 포트','number')+field('auth','API 키 인증 사용','check');if(form.host==='0.0.0.0')$('networkFields').querySelector('[data-k="auth"]').disabled=true;$('recovery').value=form.recovery_options||'';$('recovery').oninput=()=>{form.recovery_options=$('recovery').value;plans=[];invalidateSmart()};wire();connection();setupSummary()}
-function preset(k){wizardPrefs=null;plans=[];$('plans').textContent='프리셋 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='rescue'){form.vision=false;let cpu={'UD-IQ1_S':8,'UD-IQ1_M':10,'UD-IQ2_XXS':12,'UD-Q2_K_XL':14,'UD-IQ3_XXS':18,'UD-Q3_K_XL':24,'UD-Q4_K_XL':32}[form.quant]??Math.min(8,config.model_profiles[form.profile].layers);Object.assign(form,{mode:'hybrid',cpu_layers:form.profile==='inkling2'?cpu:Math.min(cpu,config.model_profiles[form.profile].layers),expert_cache:0,cpu_share:0,expert_verbose:false,context:8192,pool:8192,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:256,ubatch:128,recovery_options:''})}if(k==='safe')Object.assign(form,{mode:'hybrid',cpu_layers:8,expert_cache:0,cpu_share:0,context:32768,pool:32768,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:512,ubatch:128});if(k==='long')Object.assign(form,{context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0});if(k==='host')Object.assign(form,{mode:'gpu',context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'cpu',kv_type:'f16',ram_cache:0});if(k==='team')Object.assign(form,{mode:'gpu',parallel:15,context:1048576,pool:1572864,unified:true,kv_location:'gpu',kv_type:'q8_0',ram_cache:65536});if(k==='q4long'){Object.assign(form,{profile:'inkling2',quant:'UD-Q4_K_XL',model_path:'',mode:'hybrid',cpu_layers:32,expert_cache:8192,cpu_share:0.5,context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0,batch:512,ubatch:128});}render();preview()}
+function render(){renderWizard();let p=config.model_profiles[form.profile],q=p.quants[form.quant];$('pathFields').innerHTML=field('workspace','작업 폴더')+field('llama_dir','llama.cpp 소스 폴더','text',null,'비워 두면 작업폴더/llama.cpp')+field('model_dir','모델 폴더','text',null,'비워 두면 작업폴더/models')+field('server_exe','기존 llama-server.exe 직접 지정','text',null,'비워 두면 자동 탐색');renderDownload();$('runModel').innerHTML=models()+field('model_path','첫 GGUF 파일 직접 지정 (선택)','text',null,'자동 감지에 실패했거나 기존 다운로드를 사용하려면 지정');$('runtimeFields').innerHTML=field('runtime_cuda','공식 바이너리 CUDA','select',[['12','CUDA 12 (구형 드라이버 우선 확인)'],['13','CUDA 13 (신형 드라이버)']])+field('runtime_tag','공식 릴리스 태그 (선택)','text',null,'비워 두면 최근 안정 릴리스 중 DLL 쌍 탐색');$('buildFields').innerHTML=field('cuda_root','CUDA Toolkit 폴더 (선택)','text',null,'비워 두면 설치된 최신 nvcc 탐색; v12.2 등 전체 경로 지정 가능')+field('cuda_arch','CUDA Architecture')+field('build_jobs','병렬 빌드 작업 수','number')+field('llama_ref','Git ref / 태그 / 커밋 (선택)','text',null,'비워 두면 현재 소스 유지, 최초 clone은 기본 브랜치');$('placement').innerHTML=field('mode','가중치 모드','select',[['gpu','GPU 전체 상주'],['hybrid','GPU + CPU MoE']])+field('cpu_layers','CPU MoE 레이어 수','number',null,'앞 N개 레이어 Expert만 RAM에 저장')+field('expert_cache','동적 GPU Expert cache (MiB)','number',null,'0 = 끔 / 최신 빌드 기능')+field('cpu_share','캐시 miss CPU 연산 비율 (0~1)','number')+field('expert_verbose','Expert 캐시 상세 로그 (디버그)','check')+field('gpu_ids','GPU 번호 (예: 0,1)','text',null,'비워 두면 모든 GPU')+field('split','GPU 배치 비율 (예: 1,1)','text',null,'비워 두면 여유 VRAM 비례');$('contexts').innerHTML=field('context','슬롯당 최대 컨텍스트','number')+field('parallel','동시 슬롯 수','number')+field('unified','공유 KV 풀 사용','check')+field('pool','전체 공유 KV 풀 토큰','number',null,'공유 모드에서만 사용')+field('kv_location','활성 KV 위치','select',[['gpu','GPU (권장)'],['cpu','RAM / CPU (느릴 수 있음)']])+field('kv_type','KV 정밀도','select',[['f16','FP16 (호환성 우선)'],['q8_0','Q8_0'],['q4_0','Q4_0 (실험)']])+field('ram_cache','RAM prompt cache 상한 (MiB)','number',null,'0 = 끔; 유휴 슬롯/프롬프트 보관')+field('runtime_reserve','GPU 기타 여유 공간 (GiB)','number')+field('ram_reserve','RAM 기타 여유 공간 (GiB)','number');$('advanced').innerHTML=field('load_mode','모델 로딩 방식','select',[['auto','엔진 기본값 / 자동 탐색 허용'],['mmap','메모리 매핑'],['none','직접 읽기 (no mmap)']])+field('batch','logical batch','number')+field('ubatch','physical ubatch','number')+field('threads','CPU 연산 스레드','number')+field('reasoning','Reasoning effort','select',['none','minimal','low','medium','high','xhigh','max'].map(x=>[x,x]))+field('alias','API 모델 이름');$('networkFields').innerHTML=field('host','접속 범위','select',[['127.0.0.1','이 서버에서만 (localhost)'],['0.0.0.0','승인된 사내망의 다른 PC (0.0.0.0)']])+field('port','API 포트','number')+field('auth','API 키 인증 사용','check');if(form.host==='0.0.0.0')$('networkFields').querySelector('[data-k="auth"]').disabled=true;$('recovery').value=form.recovery_options||'';$('recovery').oninput=()=>{form.recovery_options=$('recovery').value;plans=[];invalidateSmart()};wire();connection();setupSummary()}
+function preset(k){invalidateSmart();wizardPrefs=null;plans=[];$('plans').textContent='프리셋 변경됨. 자동 배치 후보를 다시 계산하세요.';if(k==='rescue'){form.vision=false;let cpu={'UD-IQ1_S':8,'UD-IQ1_M':10,'UD-IQ2_XXS':12,'UD-Q2_K_XL':14,'UD-IQ3_XXS':18,'UD-Q3_K_XL':24,'UD-Q4_K_XL':32}[form.quant]??Math.min(8,config.model_profiles[form.profile].layers);Object.assign(form,{mode:'hybrid',cpu_layers:form.profile==='inkling2'?cpu:Math.min(cpu,config.model_profiles[form.profile].layers),expert_cache:0,cpu_share:0,expert_verbose:false,context:8192,pool:8192,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:256,ubatch:128,recovery_options:''})}if(k==='safe')Object.assign(form,{mode:'hybrid',cpu_layers:8,expert_cache:0,cpu_share:0,context:32768,pool:32768,parallel:1,unified:false,kv_location:'gpu',kv_type:'f16',ram_cache:0,batch:512,ubatch:128});if(k==='long')Object.assign(form,{context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0});if(k==='host')Object.assign(form,{mode:'gpu',context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'cpu',kv_type:'f16',ram_cache:0});if(k==='team')Object.assign(form,{mode:'gpu',parallel:15,context:1048576,pool:1572864,unified:true,kv_location:'gpu',kv_type:'q8_0',ram_cache:65536});if(k==='q4long'){Object.assign(form,{profile:'inkling2',quant:'UD-Q4_K_XL',model_path:'',mode:'hybrid',cpu_layers:32,expert_cache:8192,cpu_share:0.5,context:1048576,pool:1048576,parallel:1,unified:false,kv_location:'gpu',kv_type:'q8_0',ram_cache:0,batch:512,ubatch:128});}render();preview()}
 async function guard(fn){try{return await fn()}catch(e){toast(e.message);$('actionError').textContent=e.message;return null}}
 async function act(name,data=form){return guard(async()=>{let r=await api(name,{...data,update_source:$('update_source').checked,fresh_build:$('fresh_build').checked});toast('요청 접수: '+name);poll();return r})}
 async function stop(kind){if(confirm(kind+' 작업을 중지할까요?'))await act('stop',{kind})}
