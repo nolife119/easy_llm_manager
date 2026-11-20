@@ -115,6 +115,8 @@ def cuda_toolkit(d=None):
 
 def build_hint(message):
     x=message.lower()
+    if 'unknown projector type' in x:
+        return 'Vision projector 형식 불일치: Inkling 2의 언어 모델은 inkling2, upstream projector는 inkling2v입니다. Vision 해제 및 --no-mmproj 확인, 모델 파일이 mmproj가 아닌 첫 shard인지 확인하세요.'
     if any(t in x for t in ('no cuda toolset','could not find nvcc','could not find cudatoolkit','cuda toolkit not found','failed to find nvcc','cuda compiler identification is unknown')):
         return 'CUDA Toolkit 경로와 Visual Studio CUDA Build Customizations를 확인하세요. 공식 바이너리 설치도 가능합니다.'
     if any(t in x for t in ('unsupported microsoft visual studio','unsupported compiler','unsupported host compiler','host compiler targets','compiler is not supported')):
@@ -361,8 +363,8 @@ RECOVERY_VALUE = {'--flash-attn': {'on','off','auto'}, '--fit': {'on','off'},
                   '--cache-type-k': {'f16','q8_0','q4_0'}, '--cache-type-v': {'f16','q8_0','q4_0'}}
 RECOVERY_SWITCH = {'--no-mmap','--mmap','--no-warmup','--warmup','--no-kv-unified','--kv-unified',
                    '--no-kv-offload','--no-cont-batching','--cont-batching','--jinja','--metrics',
-                   '--cache-idle-slots','--swa-full','--no-op-offload','--no-repack'}
-RECOVERY_REMOVE_VALUE = {'--cache-ram','--kv-unified-per-slot','--chat-template-kwargs','--moe-cache-mib','--moe-cache-cpu-share','--n-cpu-moe'}
+                   '--cache-idle-slots','--swa-full','--no-op-offload','--no-repack','--no-mmproj'}
+RECOVERY_REMOVE_VALUE = {'--cache-ram','--kv-unified-per-slot','--chat-template-kwargs','--moe-cache-mib','--moe-cache-cpu-share','--n-cpu-moe','--mmproj'}
 RECOVERY_PAIRS = {'--no-mmap':'--mmap','--mmap':'--no-mmap','--no-warmup':'--warmup','--warmup':'--no-warmup',
                   '--no-kv-unified':'--kv-unified','--kv-unified':'--no-kv-unified',
                   '--no-cont-batching':'--cont-batching','--cont-batching':'--no-cont-batching'}
@@ -454,11 +456,14 @@ def command_preview(raw):
         proj=next((x for x in candidates if x.is_file()),None)
         if not proj:raise ValueError('Vision projector 파일을 찾지 못했습니다. Vision 다운로드 옵션을 선택하세요.')
         args+=['--mmproj',str(proj)]
+    else:args+=['--no-mmproj']
     if d['host']=='0.0.0.0' and not d['auth']:args+=['--no-slots']
     if d['auth']:args+=['--api-key-file',str(KEYS)]
     opts=recovery_options(d)
     if opts:
         args=apply_recovery(args,opts)
+        if '--no-mmproj' in args and '--mmproj' in args:
+            raise ValueError('Vision 체크를 해제하거나 --mmproj를 제거하세요.')
         e['danger'].append('복구 옵션 적용 중: 메모리 예상값과 GUI 설정이 최종 명령과 다를 수 있습니다. 실제 명령과 메모리를 확인하세요.')
     return d,e,args
 
@@ -700,7 +705,7 @@ def launch(raw):
     supports(str(exe),args,env)
     env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']));
     # Do not inherit unexpected API keys if the UI requests no authentication.
-    for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE'):env.pop(k,None)
+    for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
     start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options','')})
     return {'started':True}
 
@@ -828,7 +833,7 @@ def tune(raw):
             if e['danger']:
                 log('tune','메모리 재검사 실패, 후보 건너뜀: '+'; '.join(e['danger']));continue
             env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','');env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']))
-            for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE'):env.pop(k,None)
+            for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
             try:supports(str(exe),args,env)
             except ValueError as exc:log('tune',str(exc));continue
             proc=None;reader=None
