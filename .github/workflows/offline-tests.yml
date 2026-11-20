@@ -2,7 +2,7 @@ name: Offline checks
 on:
   pull_request:
   push:
-    branches: [v0.5-speed-studio]
+    branches: [v0.5-speed-studio, v0.5.1-bottleneck]
 permissions:
   contents: read
 jobs:
@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m py_compile manager.py speed.py
+      - run: python -m py_compile manager.py speed.py bottleneck.py
       - run: python -m unittest discover -s tests -v
       - uses: actions/setup-node@v4
         with:

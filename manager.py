@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64, zlib
 import speed
+import bottleneck
 import ctypes, fnmatch, hashlib, json, os, re, secrets, shutil, socket, struct, subprocess, sys, tempfile, threading, time, traceback, urllib.request, urllib.error, webbrowser, zipfile
 from collections import deque
 from pathlib import Path
@@ -838,7 +839,7 @@ def files_overlap(download_meta,server_meta):
 def start_task(kind,func,meta=None):
     with LOCK:
         if task_busy(kind):raise ValueError('이미 실행 중입니다.')
-        if (kind=='benchmark' and task_busy('download')) or (kind=='download' and task_busy('benchmark')):
+        if (kind=='benchmark' and any(task_busy(k) for k in ('download','build'))) or (kind in ('download','build') and task_busy('benchmark')):
             raise ValueError('정확한 성능 측정을 위해 다운로드와 벤치마크를 동시에 실행할 수 없습니다.')
         if (kind=='server' and task_busy('build')) or (kind=='build' and task_busy('server')):raise ValueError('빌드와 서버 실행을 동시에 할 수 없습니다.')
         if kind=='server' and task_busy('download') and files_overlap(TASKS['download']['meta'],meta or {}):raise ValueError('실행할 GGUF 또는 projector가 현재 다운로드 대상과 겹칩니다.')
@@ -1364,6 +1365,88 @@ def speed_sample(port,workload,n,m,auth=False):
         if isinstance(timing.get(k),int):result[k]=timing[k]
     return result
 
+def request_timing_from_log(lines):
+    # Only use the request's own newly emitted lines, never a prior response.
+    out={}
+    for line in lines:
+        m=re.search(r'(prompt eval time|(?<!prompt )eval time)\s*=\s*[\d.]+\s*ms\s*/\s*(\d+)\s*(?:tokens|runs).*?([\d.]+)\s*tokens per second',line,re.I)
+        if not m:continue
+        prefix='prompt' if m[1].lower().startswith('prompt') else 'predicted'
+        out[prefix+'_n']=int(m[2]);out[prefix+'_per_second']=float(m[3])
+    return out
+
+def bottleneck_test(raw):
+    # Test the already running server, without reloading a 594B model for every request.
+    with LOCK:
+        t=TASKS.get('server',{});meta=dict(t.get('meta',{}))
+        if not t.get('active') or not meta:raise ValueError('정상 서버를 먼저 실행하세요.')
+        if any(task_busy(k) for k in ('build','download','benchmark','tune')):raise ValueError('다른 작업을 먼저 중지하세요.')
+        if meta.get('parallel')!=1:raise ValueError('단일 슬롯 전용 진단입니다.')
+    if api_json(meta['port'],'/health',auth=meta['auth']).get('status')!='ok':raise ValueError('서버가 아직 준비되지 않았습니다.')
+    long_n=num({'n':raw.get('long_tokens',32768)},'n',8192,262144)
+    long_m=num({'n':raw.get('long_output',1024)},'n',256,4096)
+    repeats=num({'n':raw.get('repeats',2)},'n',1,3)
+    suite=bottleneck.cases(meta['context'],long_n,long_m,bool(raw.get('full_sweep')))
+    key=read_keys()[0] if meta['auth'] else None
+    port=meta['port'];alias=meta['alias']
+    def cancelled():
+        with LOCK:return bool(TASKS['benchmark']['cancel'] or not task_busy('server') or TASKS['server']['started']!=t['started'])
+    def job():
+        rows=[];prepared={}
+        set_task_meta('benchmark',bottleneck_mode=True,results=[],comparisons=[],total=len(suite),repeats=repeats,context=meta['context'],quant=meta['quant'],kv=meta['kv_type'])
+        for i,case in enumerate(suite):
+            if cancelled():break
+            set_task_meta('benchmark',index=i+1,current=case['label'])
+            log('benchmark',f'{i+1}/{len(suite)} {case["label"]}')
+            samples=[]
+            try:
+                if case['n'] not in prepared:
+                    n=case['n']
+                    # Tokenize only synthetic text once at each size; preserve a complete task suffix.
+                    text=bottleneck.synthetic_text(n)
+                    ids=api_json(port,'/tokenize',{'content':text,'add_special':False},meta['auth'],120).get('tokens',[])
+                    tail=api_json(port,'/tokenize',{'content':bottleneck.TASK,'add_special':False},meta['auth'],30).get('tokens',[])
+                    if not ids or not tail or len(ids)<n-len(tail):raise RuntimeError('합성 토큰 길이 부족')
+                    prefix=ids[:n-len(tail)]
+                    # Chat path uses detokenized prefix, so template overhead remains measured.
+                    decoded=api_json(port,'/detokenize',{'tokens':prefix},meta['auth'],120).get('content')
+                    if not isinstance(decoded,str):raise RuntimeError('detokenize 미지원')
+                    prepared[n]=(decoded,prefix+tail)
+                text,ids=prepared[case['n']]
+                path,body=bottleneck.request(case,text,ids,alias)
+                for repeat in range(repeats):
+                    if cancelled():break
+                    # Wall-clock and streaming first-content latency are separate from engine decode timing.
+                    begin=time.time()
+                    with LOCK:before=list(LOGS['server'])
+                    data=bottleneck.run_http(port,path,body,key,cancelled,timeout=900)
+                    # Capture only appended log records; when the ring rotates, find its retained suffix.
+                    time.sleep(.25)
+                    with LOCK:after=list(LOGS['server'])
+                    overlap=0
+                    for k in range(min(len(before),len(after)),0,-1):
+                        if before[-k:]==after[:k]:overlap=k;break
+                    new=after[overlap:]
+                    # Fallback only when there is a single completed eval record and no concurrent users.
+                    eval_lines=[line for line in new if re.search(r'(?<!prompt )eval time\s*=',line,re.I)]
+                    fallback=request_timing_from_log(new) if len(eval_lines)==1 else {}
+                    sample=bottleneck.measurements(data,fallback,case['out'])
+                    samples.append(sample)
+                    log('benchmark',f'{repeat+1}/{repeats} | {sample["decode"]:.2f} t/s | input {sample["prompt_n"]}, output {sample["output_n"]} | {sample["source"]}')
+                if cancelled():break
+                result=bottleneck.summarize(samples)
+                row={**case,**result,'status':'ok'}
+            except Exception as exc:
+                if cancelled():break
+                # Do not store exception body from a server: it can contain private data.
+                row={**case,'status':'error','error':type(exc).__name__+': '+str(exc)[:400] if isinstance(exc,(ValueError,RuntimeError)) else type(exc).__name__}
+                log('benchmark','시험 실패: '+row['error'])
+            rows.append(row)
+            set_task_meta('benchmark',results=list(rows),comparisons=bottleneck.compare(rows))
+            if i==0 and row['status']!='ok':raise RuntimeError('기준 시험 실패: 로그 및 엔진 호환성을 확인하세요.')
+        log('benchmark','진단은 합성 요청 기준입니다. 실제 Claude Code 요청과 완전히 동일하지 않습니다.')
+    start_task('benchmark',job,{'bottleneck_mode':True,'total':len(suite),'results':[],'comparisons':[]})
+
 def speed_tune(raw):
     if any(task_busy(k) for k in ('build','download','server','benchmark','tune')):raise ValueError('서버와 다른 작업을 중지한 후 가속 시험을 시작하세요.')
     d,_,_=validate(raw)
@@ -1612,13 +1695,14 @@ class Handler(BaseHTTPRequestHandler):
             elif action=='plan':result=placement_plan(d)
             elif action=='recommend':result=recommend_setup(d)
             elif action=='benchmark':benchmark(d)
+            elif action=='bottleneck':bottleneck_test(d)
             elif action=='tune':tune(d)
             elif action=='speed_info':result=speed_info(d)
             elif action=='speed_tune':speed_tune(d)
             elif action=='local_models':result={'models':local_models(d)}
             elif action=='start':result=launch(d)
             elif action=='stop':
-                if raw.get('kind') not in ('download','server','build','tune'):raise ValueError('invalid task')
+                if raw.get('kind') not in ('download','server','build','tune','benchmark'):raise ValueError('invalid task')
                 stop_task(raw['kind'])
             elif action=='key':result=key_action(raw['action'],raw.get('index'),raw.get('expected'))
             elif action=='probe_access':result=probe_access()
