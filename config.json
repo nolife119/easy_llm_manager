@@ -102,9 +102,17 @@
     "expert_verbose": false,
     "recovery_options": "",
     "load_mode": "auto",
-    "gpu_fast": false
+    "gpu_fast": false,
+    "spec_mode": "none",
+    "backend_sampling": false,
+    "cuda_p2p": false,
+    "split_mode": "layer",
+    "cuda_graphs": "auto",
+    "draft_path": "",
+    "draft_tokens": 7
   },
   "cuda_root": "",
   "runtime_cuda": "12",
-  "runtime_tag": ""
+  "runtime_tag": "",
+  "version": "0.5"
 }
