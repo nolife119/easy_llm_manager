@@ -114,5 +114,5 @@
   "cuda_root": "",
   "runtime_cuda": "12",
   "runtime_tag": "",
-  "version": "0.5"
+  "version": "0.5.1"
 }
