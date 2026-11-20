@@ -43,6 +43,10 @@ STATE.mkdir(parents=True,exist_ok=True)
 PREF=STATE/'settings.json'
 KEYS=STATE/'api-keys.txt'
 BENCH_HISTORY=STATE/'benchmark-history.json'
+LAST_READY_FILE=STATE/'last-ready.json'
+try: LAST_READY=json.loads(LAST_READY_FILE.read_text(encoding='utf-8'))
+except (OSError,ValueError): LAST_READY={}
+if not isinstance(LAST_READY,dict): LAST_READY={}
 try: SETTINGS=json.loads(PREF.read_text(encoding='utf-8'))
 except (OSError, ValueError): SETTINGS={}
 
@@ -1092,6 +1096,23 @@ def error_excerpt(lines):
         if re.search(r'error|failed|fatal|assert|exception|out of memory|invalid|자동 진단|종료 코드',ln,re.I) and not ln.startswith('> '):bad.append(ln)
     return bad[-15:] if bad else lines[-8:]
 
+def record_last_ready(t,health):
+    global LAST_READY
+    try:
+        if json.loads(health).get('status')!='ok':return
+    except (ValueError,TypeError,AttributeError):return
+    with LOCK:
+        cur=TASKS.get('server',{})
+        meta=t.get('meta',{})
+        if not cur.get('active') or cur.get('started')!=t.get('started') or not meta.get('settings'):return
+        if LAST_READY.get('started')==t['started']:return
+        LAST_READY={'started':t['started'],'settings':dict(meta['settings']),'engine':meta.get('engine','')}
+        try:
+            tmp=LAST_READY_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(LAST_READY,ensure_ascii=False,indent=2),encoding='utf-8')
+            tmp.replace(LAST_READY_FILE)
+        except OSError:log('system','마지막 정상 구동 설정을 디스크에 저장하지 못했습니다. 현재 세션에만 보관합니다.')
+
 def status():
     with LOCK:
         ts={k:{x:v for x,v in t.items() if x not in ('proc','cancel')}|{'pid':t['proc'].pid if t['proc'] else None} for k,t in TASKS.items()}; logs={k:list(v) for k,v in LOGS.items()}
@@ -1101,6 +1122,7 @@ def status():
         if health:
             metrics=local_api(meta['port'],'/metrics',meta['auth'])
             if meta.get('host')!='0.0.0.0':slots=local_api(meta['port'],'/slots',meta['auth'])
+    record_last_ready(t,health)
     rt,rf=ram()
     # slots can contain prompt internals depending on build; only report selected counters.
     slim=[]
@@ -1108,7 +1130,7 @@ def status():
         for s in json.loads(slots):
             if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining','n_remain','n_prompt_tokens','n_prompt_tokens_processed','n_prompt_tokens_cached','n_cache_tokens') if k in s})
     except (ValueError,TypeError):pass
-    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys())}
+    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys()),'last_ready':LAST_READY}
 
 
 def save_prefs(raw):
@@ -1125,7 +1147,7 @@ HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name
 <section id="env" class="tab"><div class="cols"><div class="panel"><h2>환경 진단</h2><p>먼저 GPU와 필수 도구를 확인하세요. 설치 직후 PATH가 갱신되지 않았다면 이 도구를 다시 실행하세요.</p><div class="buttons"><button class="primary" onclick="diagnose()">환경 다시 검사</button><button onclick="act('install_hf',{})">HF 다운로드 도구 설치</button></div><div id="diagnosis"></div></div><div class="panel"><h2>저장 경로</h2><p>기존 AI 폴더 또는 여유 공간이 큰 고정 디스크를 탐색합니다. 필요하면 직접 수정하세요.</p><div id="pathFields"></div><div class="buttons"><button onclick="save()">경로/세팅 저장</button></div><p>모델, 빌드 결과는 작업 폴더에 저장합니다. 개인 설정과 API 키는 사용자 전용 데이터 폴더에 저장합니다.</p></div></div></section>
 <section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><p>다운로드 선택은 서버 설정과 독립적입니다. 실행 중인 동일 파일은 보호됩니다.</p><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect',downloadForm())">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
 <section id="build" class="tab hidden"><div class="cols"><div class="panel"><h2>llama.cpp 엔진 관리 · CUDA 빌드</h2><p>이미 체크아웃한 호환 브랜치가 있다면 아래 버튼을 사용하세요. 기존 소스를 업데이트하지 않습니다.</p><div class="buttons"><button onclick="scanEngines()">소스 및 실행 파일 검색</button><button class="primary" onclick="buildCurrent()">현재 체크아웃 그대로 빌드</button></div><div id="engineList"></div><details><summary>일반 빌드 / 공식 바이너리 설치</summary><p>기존 소스를 재사용하고 없다면 공식 Git 저장소에서 clone합니다. Visual Studio C++ 빌드 도구와 CUDA Toolkit이 필요합니다.</p><div id="buildFields"></div><h3>공식 사전 컴파일 바이너리 (컴파일 대안)</h3><div id="runtimeFields"></div><div class="buttons"><button onclick="installBinary()">공식 CUDA 바이너리 설치</button><button onclick="useInstalled()">설치/빌드 결과 실행 파일 적용</button></div><p>GitHub 공식 릴리스만 사용합니다. CUDA 12/13은 드라이버와 호환되는 버전을 선택하세요.</p><label class="check"><input type="checkbox" id="fresh_build">새 빌드 폴더 사용 (기존 파일 유지)</label><label class="check"><input type="checkbox" id="update_source">기존 소스 업데이트 (변경사항이 없을 때만)</label><div class="buttons"><button class="primary" onclick="act('build')">컴파일 시작</button><button onclick="stop('build')">중지</button></div><p>H100은 CUDA arch 90. Git ref를 지정하면 해당 버전으로 빌드합니다. 최초 빌드는 오래 걸릴 수 있습니다.</p></details></div><div class="panel"><h2>빌드 로그</h2><pre id="buildLog"></pre><p>오류 시 마지막 로그와 환경 진단을 확인하세요. 기존 CMake 생성기와 충돌한다면 소스를 보존하고 build 폴더만 이름을 변경한 후 다시 빌드하세요.</p></div></div></section>
-<section id="run" class="tab hidden"><div class="hero"><div><h2>서버 실행</h2><p>모델 → 접속 → 사용 목적. 나머지는 자동 추천하거나 기존 세팅을 그대로 사용합니다.</p></div><span id="runLive" class="pillstatus">상태 확인 중</span></div><div class="studio"><div class="panel"><div class="stage"><div class="eyebrow">01 · 모델</div><h3>어떤 모델을 실행할까요?</h3><div id="runModel"></div><div id="engineLabel" class="mini-note"></div><details><summary>모델 호환성 검사</summary><button onclick="inspectLocal()">GGUF 확인</button><pre id="localModelInspection">파일을 변경하지 않습니다.</pre></details></div><div class="stage"><div class="eyebrow">02 · 접속 및 인증</div><h3>누가 사용할까요?</h3><div id="networkFields"></div><div id="networkNotice"></div><div class="buttons"><button onclick="tab('auth')">API 키 관리 / 발급</button><button onclick="refreshAddresses()">서버 IP 확인</button></div><div id="addressList" class="mini-note"></div></div><div class="stage"><div class="eyebrow">03 · 사용 목적</div><div id="wizard"></div></div><details id="advancedDetails"><summary>고급 설정 · 숫자 직접 조정 및 복구</summary><div class="buttons"><button onclick="preset('rescue')">8K 복구</button><button onclick="preset('team')">공유 KV 15인</button></div><h3>메모리 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진</h3><div class="grid" id="advanced"></div><h3>오류 복구 JSON</h3><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--no-mmap":true}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="plan()">추가 배치 후보</button></div><div id="plans"></div></details></div><div class="sticky"><div class="panel"><h2>실행 준비</h2><div id="setupSummary"></div><div class="buttons"><button class="primary" id="smartStart" onclick="wizardStart()">추천값으로 시작</button><button id="exactStart" onclick="startServer()">현재 설정 그대로 시작</button><button onclick="save()">설정 저장</button><button onclick="stop('server')">서버 중지</button></div><p class="mini-note">추천은 CPU 분산 등 숫자를 다시 계산합니다. 이미 정상 구동한 설정은 '현재 설정 그대로 시작'을 사용하세요.</p><button onclick="restoreActive()">최근 실행 설정 복원</button><button onclick="preview()">메모리 미리보기</button><div id="estimate"><p>실행 전 예상치를 확인합니다.</p></div><details><summary>실제 실행 명령</summary><pre id="command"></pre></details></div><div class="panel"><h2>접속 주소</h2><div id="connection"></div><p>관리 화면은 항상 localhost 전용입니다. 사내망 방화벽은 승인된 범위에서 별도 설정하세요.</p></div></div></div></section>
+<section id="run" class="tab hidden"><div class="hero"><div><h2>서버 실행</h2><p>모델 → 접속 → 사용 목적. 나머지는 자동 추천하거나 기존 세팅을 그대로 사용합니다.</p></div><span id="runLive" class="pillstatus">상태 확인 중</span></div><div class="studio"><div class="panel"><div class="stage"><div class="eyebrow">01 · 모델</div><h3>어떤 모델을 실행할까요?</h3><div id="runModel"></div><div id="engineLabel" class="mini-note"></div><details><summary>모델 호환성 검사</summary><button onclick="inspectLocal()">GGUF 확인</button><pre id="localModelInspection">파일을 변경하지 않습니다.</pre></details></div><div class="stage"><div class="eyebrow">02 · 접속 및 인증</div><h3>누가 사용할까요?</h3><div id="networkFields"></div><div id="networkNotice"></div><div class="buttons"><button onclick="tab('auth')">API 키 관리 / 발급</button><button onclick="refreshAddresses()">서버 IP 확인</button></div><div id="addressList" class="mini-note"></div></div><div class="stage"><div class="eyebrow">03 · 사용 목적</div><div id="wizard"></div></div><details id="advancedDetails"><summary>고급 설정 · 숫자 직접 조정 및 복구</summary><div class="buttons"><button onclick="preset('rescue')">8K 복구</button><button onclick="preset('team')">공유 KV 15인</button></div><h3>메모리 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진</h3><div class="grid" id="advanced"></div><h3>오류 복구 JSON</h3><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--no-mmap":true}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="plan()">추가 배치 후보</button></div><div id="plans"></div></details></div><div class="sticky"><div class="panel"><h2>실행 준비</h2><div id="setupSummary"></div><div class="buttons"><button class="primary" id="smartStart" onclick="wizardStart()">추천값으로 시작</button><button id="exactStart" onclick="startServer()">현재 설정 그대로 시작</button><button id="restartExact" class="primary hidden" onclick="restartCurrent()">현재 설정으로 재시작</button><button onclick="save()">설정 저장</button><button onclick="stop('server')">서버 중지</button></div><p class="mini-note">추천은 CPU 분산 등 숫자를 다시 계산합니다. 이미 정상 구동한 설정은 '현재 설정 그대로 시작'을 사용하세요.</p><button onclick="restoreActive()">마지막 정상 구동 설정 복원</button><button onclick="preview()">메모리 미리보기</button><div id="estimate"><p>실행 전 예상치를 확인합니다.</p></div><details><summary>실제 실행 명령</summary><pre id="command"></pre></details></div><div class="panel"><h2>접속 주소</h2><div id="connection"></div><p>관리 화면은 항상 localhost 전용입니다. 사내망 방화벽은 승인된 범위에서 별도 설정하세요.</p></div></div></div></section>
 <section id="monitor" class="tab hidden"><div class="panel hero"><div><div class="eyebrow">LIVE · INFERENCE</div><h2 id="monitorState">추론 서버</h2><p id="monitorMeta">아직 실행하지 않았습니다.</p><div id="health" class="mini-note"></div></div><div class="buttons"><button onclick="tab('run')">실행 설정</button><button onclick="poll()">갱신</button><button onclick="stop('server')">서버 중지</button></div></div><div class="dashgrid" id="throughput"></div><div class="panel" style="margin-top:14px"><h2>최근 처리량 · 최근 2분 내 최대 40개 표본</h2><div class="cols"><div><p>입력 처리 / Prefill (tokens/s)</p><div id="promptTrend"></div></div><div><p>출력 생성 / Decode (tokens/s)</p><div id="decodeTrend"></div></div></div><p class="mini-note" id="metricSource">실측 엔진 카운터 또는 완료된 요청 로그를 표시합니다. 표본이 없으면 —.</p></div><div class="cols"><div class="panel"><h2>요청 · 컨텍스트 · 캐시</h2><div id="rates" class="dashgrid"></div><div id="slotDisplay"></div><p class="mini-note">입력 처리 토큰은 캐시 재사용 전 전체 프롬프트 길이와 다를 수 있습니다. KV 점유율과 Expert 적중률은 각각 다른 지표입니다.</p></div><div class="panel"><h2>하드웨어</h2><div id="gpuCards" class="grid"></div><div id="ramCard"></div><details><summary>다른 작업 상태</summary><div id="taskCards" class="grid"></div></details></div></div><div class="panel"><div class="hero"><h2>서버 로그</h2><span id="logCount" class="mini-note"></span></div><div id="errorBanner"></div><div class="inline-controls"><input id="logSearch" type="search" placeholder="로그 검색" oninput="renderServerLog()"><select id="logFilter" onchange="renderServerLog()"><option value="all">모든 로그</option><option value="errors">오류 / 경고</option><option value="timing">토큰 / 캐시 / 타이밍</option><option value="loading">모델 로딩</option></select><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><button onclick="copyServerLog()">표시 로그 복사</button></div><div id="serverLog" class="logview" style="background:#0c131c;border-radius:7px;padding:12px;font:12px/1.65 Consolas,monospace"></div><details><summary>최근 실행 요청 오류 / 자동 진단</summary><pre id="actionError">—</pre><pre id="serverErrors">—</pre><input id="diagCommand" list="diagList" value="llama-server --version"><datalist id="diagList"><option value="llama-server --version"><option value="llama-server --help"><option value="llama-server --list-devices"><option value="nvidia-smi"><option value="nvidia-smi -q"><option value="nvcc --version"></datalist><div class="buttons"><button onclick="runDiagnostic()">진단 실행</button></div><pre id="diagOutput"></pre></details><details><summary>원시 /metrics · 익명화된 /slots</summary><pre id="metrics"></pre><pre id="slots"></pre></details></div></section>
 <section id="tuning" class="tab hidden"><div class="panel"><h2>실측 벤치마크 · 자동 튜닝</h2><p>합성 토큰만 사용합니다. 단일 슬롯에서 테스트하세요. 자동 튜닝은 서버를 중지한 상태에서 여러 후보를 직접 로딩하고 실패 시 다음 후보로 이동합니다. 1M 설정은 매우 오래 걸릴 수 있습니다. 입력 길이를 짧게 시작하세요.</p><div class="grid"><label class="field"><span>입력 토큰 수</span><input type="number" id="bench_prompt" value="512" min="32" max="1048576"></label><label class="field"><span>생성 토큰 수</span><input type="number" id="bench_output" value="128" min="16" max="1024"></label></div><div class="buttons"><button onclick="runBench(false)">실행 중 서버 벤치마크</button><button class="primary" onclick="runBench(true)">자동 튜닝 (서버 중지 후)</button><button onclick="stop('tune')">튜닝 중지</button><button onclick="applyBest()">가장 빠른 실측 후보 적용</button></div><div id="tuneBest"></div><h3>최근 측정 (최대 10개)</h3><div id="history"></div><h3>벤치마크 로그</h3><pre id="benchmarkLog"></pre><h3>튜닝 로그</h3><pre id="tuneLog"></pre></div></section><section id="auth" class="tab hidden"><div class="studio"><div class="panel"><div class="eyebrow">ACCESS CONTROL</div><h2>API 키 관리</h2><div id="authState"></div><p>서버에 접속하는 사람마다 키를 하나씩 발급하세요. 키 원문은 생성할 때만 표시하며 기존 키는 가립니다.</p><div class="buttons"><button class="primary" id="addKey" onclick="key('add')">새 API 키 발급</button><button onclick="keys()">목록 새로고침</button></div><div id="newKey"></div><div id="keyList"></div><p class="mini-note">인증이 켜진 서버는 중지 후 발급·회수해야 합니다. 로컬 미인증 서버에서는 미리 발급 가능합니다. 저장된 키는 다음 인증 시작 시 적용됩니다.</p></div><div class="panel"><h2>연결 &amp; 인증 테스트</h2><div id="authConnection"></div><button onclick="testAccess()">현재 서버 API 테스트</button><pre id="accessTest">실행 후 테스트하면 API 응답 코드를 확인합니다.</pre><p>공유 서버에는 API 키가 필수입니다. HTTP는 암호화되지 않으므로 승인된 네트워크/TLS 프록시가 필요합니다. 사용자별 토큰 회계나 권한 격리는 지원하지 않습니다.</p><button onclick="tab('run')">서버 실행 설정으로</button></div></div></section></main><div id="toast" role="status"></div>
 <script>
@@ -1188,7 +1210,7 @@ async function runBench(tuning){const prompt=Number($('bench_prompt').value),out
 function applyBest(){const b=prev?.tasks?.tune?.meta?.best;if(!b){toast('성공한 자동 튜닝 결과가 없습니다.');return}const a=b.settings;if(a.profile!==form.profile||a.quant!==form.quant||a.context!==form.context||a.kv_type!==form.kv_type||a.kv_location!==form.kv_location||a.parallel!==form.parallel){toast('모델/컨텍스트/슬롯/KV 설정이 측정 조건과 다릅니다. 동일하게 맞춘 후 적용하세요.');return}Object.assign(form,{mode:a.cpu_layers?'hybrid':'gpu',cpu_layers:a.cpu_layers,expert_cache:a.expert_cache,cpu_share:a.cpu_share});render();tab('run');preview();toast('실측 후보 적용. 예상치 확인 후 시작하세요.')}
 function benchView(s){let h=s.history||[];let best=s.tasks.tune?.meta?.best;$('tuneBest').textContent=best?`가장 빠른 측정: ${fmt(best.predicted_per_second)} t/s (warm), CPU ${best.settings.cpu_layers}층 / ${best.settings.expert_cache} MiB / share ${best.settings.cpu_share}`:'아직 성공한 튜닝 결과 없음';$('history').innerHTML=h.length?'<table><tr><th>시각 / 모델</th><th>입력 · 출력</th><th>Prefill / Decode (t/s)</th><th>CPU 층 / 캐시 MiB / share</th></tr>'+h.slice().reverse().map(x=>`<tr><td>${esc(x.date)}<br>${esc(x.settings.quant)} (${esc(x.kind)})</td><td>${esc(x.requested_prompt)} / ${esc(x.requested_output)}</td><td>${fmt(x.prompt_per_second)} / ${fmt(x.predicted_per_second)}</td><td>${esc(x.settings.cpu_layers)} / ${esc(x.settings.expert_cache)} / ${esc(x.settings.cpu_share)}</td></tr>`).join('')+'</table>':'<p>아직 측정 결과가 없습니다.</p>';logs('benchmarkLog',s.logs.benchmark||[]);logs('tuneLog',s.logs.tune||[])}
 
-let starting=false;
+let starting=false,restarting=false;
 async function startServer(){
  if(starting||prev?.tasks?.server?.active){toast('현재 서버를 중지한 뒤 실행하세요.');return}
  if(!await preflightKeys())return;
@@ -1200,7 +1222,7 @@ async function startServer(){
   let r=await api('start',{...form,force:!!dangers.length});
   if(r.confirm){if(!confirm(r.danger.join('\n')+'\n그래도 진행할까요?'))return;if(snapshot!==JSON.stringify(form))throw Error('설정 변경됨. 다시 시작하세요.');r=await api('start',{...form,force:true})}
   if(!r.started)throw Error('서버 시작이 확인되지 않았습니다.');
-  try{await api('save',form)}catch(e){toast('실행은 시작됐지만 설정 저장 실패: '+e.message)}
+  try{await api('save',JSON.parse(snapshot))}catch(e){toast('실행은 시작됐지만 설정 저장 실패: '+e.message)}
   toast('서버 실행 요청 완료');tab('monitor');poll();
  }catch(e){$('actionError').textContent=e.message;toast(e.message)}finally{starting=false;setupSummary()}
 }
@@ -1220,10 +1242,28 @@ function setupSummary(){
  $('networkNotice').innerHTML='<p class="'+(form.auth&&!keyCount?'warn':'muted')+'">'+(remote?'사내망에서는 키 인증 필수 · 슬롯 상세 비공개':'이 컴퓨터에서만 접속')+' · 등록된 API 키 '+keyCount+'개'+(form.auth&&!keyCount?' · 먼저 키를 생성하세요':'')+'</p>';
  $('setupSummary').innerHTML='<div class="metric"><small>현재 직접 실행 세팅</small><b>'+esc(form.quant)+'</b><p>'+esc(Number(form.context).toLocaleString())+' tokens / '+esc(form.parallel)+' 슬롯</p><p>'+esc(form.mode==='gpu'?'GPU 전체 상주':'GPU + CPU Expert '+form.cpu_layers+'층')+' · '+esc(form.kv_location.toUpperCase())+' KV '+esc(form.kv_type.toUpperCase())+'</p><p>'+esc(remote?'사내망 · API 키':'로컬 전용')+' · 포트 '+esc(form.port)+'</p></div>';
  $('runLive').textContent=active?'실행 중 · 변경은 재시작 후 반영':'중지 상태';
- $('smartStart').disabled=!!(active||starting||wizardBusy);$('exactStart').disabled=!!(active||starting||wizardBusy);
+ $('smartStart').disabled=!!(active||starting||wizardBusy||restarting);$('exactStart').disabled=!!(active||starting||wizardBusy||restarting);$('restartExact').classList.toggle('hidden',!active);$('restartExact').disabled=!!(starting||restarting||wizardBusy);
 }
 async function preflightKeys(){try{const r=await api('keys');keyCount=r.keys.length;if(form.host==='0.0.0.0'&&!form.auth){form.auth=true;render()}if(form.auth&&!keyCount){toast('API 키를 먼저 발급하세요.');tab('auth');return false}return true}catch(e){toast(e.message);return false}}
-function restoreActive(){const m=prev?.tasks?.server?.meta;if(!m?.settings){toast('이 버전에서 실행한 설정 기록이 아직 없습니다. 저장된 설정으로 시작하세요.');return}if(!confirm('최근 실행 요청의 모델/성능 설정을 복원할까요? 접속 및 인증 설정은 유지합니다.'))return;const keep={host:form.host,port:form.port,auth:form.auth};Object.assign(form,m.settings,keep,{server_exe:m.engine||form.server_exe});wizardPrefs=null;render();toast('최근 실행 설정 복원 완료')}
+function restoreActive(){const m=prev?.last_ready?.settings?prev.last_ready:config.last_ready;if(!m?.settings){toast('v0.4에서 Health OK를 기록한 설정이 아직 없습니다. 기존 저장 설정을 사용하세요.');return}if(!confirm('마지막 정상 구동 모델/성능 설정을 복원할까요? 현재 접속 및 인증 설정은 유지합니다.'))return;const keep={host:form.host,port:form.port,auth:form.auth};Object.assign(form,m.settings,keep,{server_exe:m.engine||form.server_exe});wizardPrefs=null;render();toast('마지막 정상 구동 설정 복원 완료')}
+async function restartCurrent(){
+ if(restarting||starting||!prev?.tasks?.server?.active)return;
+ if(!await preflightKeys())return;
+ if(!confirm('현재 추론 요청이 종료되고 모델을 다시 로딩합니다. 화면의 설정으로 재시작할까요?'))return;
+ const snapshot=JSON.stringify(form);restarting=true;setupSummary();let canStart=false;
+ try{
+  await api('stop',{kind:'server'});toast('서버 중지 확인 중…');
+  const end=Date.now()+45000;
+  while(Date.now()<end){
+   const state=await api('status');
+   if(!state.tasks.server?.active){prev=state;canStart=true;break}
+   await new Promise(resolve=>setTimeout(resolve,1250));
+  }
+  if(!canStart)throw Error('서버 중지를 확인할 수 없습니다. 모니터에서 상태를 확인하세요.');
+  if(snapshot!==JSON.stringify(form)){canStart=false;throw Error('중지 중 설정이 변경됐습니다. 현재 설정을 검토하고 시작하세요.')}
+ }catch(e){canStart=false;toast(e.message)}finally{restarting=false;setupSummary()}
+ if(canStart)await startServer();else poll();
+}
 
 function logs(id,items,follow=true){const x=$(id),v=items.join('\n');if(x.textContent!==v){x.textContent=v;if(follow)x.scrollTop=x.scrollHeight}}
 let trend=[],prevSample=null,lastServerRun=null,filteredLogs=[],logSignature='';
@@ -1266,7 +1306,7 @@ function renderDashboard(s){
  const m=parseMetrics(s.metrics),log=timingLogs(s.logs.server);
  const ptotal=getMetric(m,'prompt_tokens_total'),dtotal=getMetric(m,'tokens_predicted_total','predicted_tokens_total');
  const pg=getMetric(m,'prompt_tokens_seconds','prompt_tokens_per_second'),dg=getMetric(m,'predicted_tokens_seconds','predicted_tokens_per_second');
- const processing=getMetric(m,'requests_processing'),queued=getMetric(m,'requests_deferred'),kv=getMetric(m,'kv_cache_usage_ratio','kv_cache_usage');
+ let hp={};try{hp=JSON.parse(s.health)||{}}catch{};const hs=Number.isFinite(hp.slots_processing)?hp.slots_processing:null;const processing=getMetric(m,'requests_processing')??hs,queued=getMetric(m,'requests_deferred'),kvRaw=getMetric(m,'kv_cache_usage_ratio','kv_cache_usage'),kv=kvRaw!=null&&kvRaw>=0&&kvRaw<=1?kvRaw:null;
  const pk=getMetric(m,'kv_cache_tokens','kv_cache_tokens_total'),maxctx=getMetric(m,'n_tokens_max');
  const now=Number(s.sample_time)||Date.now()/1000;
  // Counter changes are observed wall-clock work, not a per-request generation benchmark.
@@ -1287,7 +1327,7 @@ function renderDashboard(s){
  $('throughput').innerHTML=bigMetric('입력 처리 · Prefill',numRate(pv),src(pg,log.prompt,log.promptLine))+bigMetric('출력 생성 · Decode',numRate(dv),src(dg,log.decode,log.decodeLine))+bigMetric('누적 처리 입력',cnt(ptotal),ptotal==null?'최근 입력 로그: '+cnt(log.promptN):'서버 카운터 · tokens')+bigMetric('누적 생성 출력',cnt(dtotal),dtotal==null?'최근 출력 로그: '+cnt(log.decodeN):'서버 카운터 · tokens')+bigMetric('현재 구간 입력',numRate(liveP),'카운터 변화 / 실제 경과 시간')+bigMetric('현재 구간 출력',numRate(liveD),'완료 시 갱신되는 엔진은 계단형');
  spark('promptTrend','prompt');spark('decodeTrend','decode');
  $('metricSource').textContent=s.metrics?'그래프: 최근 조회 사이 누적 토큰 카운터 변화 / 경과 시간. 완료 요청 단위 갱신이면 순간 속도와 다릅니다. 상단 평균 t/s는 엔진 또는 완료 로그 값입니다.':'/metrics 미응답 또는 미지원. 상단은 완료 로그에서 확인 가능한 값만 표시하며 그래프와 누적 지표는 비어 있을 수 있습니다.';
- $('rates').innerHTML=metric('처리 중',cnt(processing),'요청')+metric('대기 중',cnt(queued),'요청')+metric('KV 점유율',kv==null?'—':(kv*100).toFixed(1)+'%',kv==null?'엔진 미보고':'엔진 측정값')+metric('KV 저장 토큰',cnt(pk),'엔진 제공 시')+metric('최대 관측 컨텍스트',cnt(maxctx),'엔진 high watermark')+metric('Expert cache hit',cached.hit_rate==null?'—':fmt(cached.hit_rate)+'%',cached.samples?cached.samples+'개 최근 로그 표본':'지원 로그 없음')+metric('Expert hit / miss',cached.samples?cnt(cached.hits)+' / '+cnt(cached.misses):'—',cached.samples?'CPU miss '+cnt(cached.cpu):'비활성 또는 로그 미지원')+metric('Expert 업로드',cached.samples?fmt(cached.uploaded_mib)+' MiB':'—','최근 로그 누적');
+ $('rates').innerHTML=metric('처리 중',cnt(processing),'요청')+metric('대기 중',cnt(queued),'요청')+metric('KV 점유율',kv==null?'—':(kv*100).toFixed(1)+'%',kv==null?'엔진 미보고':'엔진 측정값')+metric('KV 저장 토큰',cnt(pk),'엔진 제공 시')+metric('최대 관측 컨텍스트',cnt(maxctx),'엔진 high watermark')+metric('설정 컨텍스트',cnt(meta.context),'슬롯당 한도 · '+cnt(meta.parallel)+' 슬롯')+metric('최근 입력 / 출력',cnt(log.promptN)+' / '+cnt(log.decodeN),'완료 로그의 처리 토큰 · 동일 요청 보장 없음')+metric('Expert cache hit',cached.hit_rate==null?'—':fmt(cached.hit_rate)+'%',cached.samples?cached.samples+'개 최근 로그 표본':'지원 로그 없음')+metric('Expert hit / miss',cached.samples?cnt(cached.hits)+' / '+cnt(cached.misses):'—',cached.samples?'CPU miss '+cnt(cached.cpu):'비활성 또는 로그 미지원')+metric('Expert 업로드',cached.samples?fmt(cached.uploaded_mib)+' MiB':'—','최근 로그 누적');
  const slots=s.slots||[];
  $('slotDisplay').innerHTML=slots.length?'<h3>슬롯별 현황</h3><table><tr><th>ID</th><th>상태</th><th>컨텍스트</th><th>입력 처리/캐시</th><th>생성</th></tr>'+slots.map(z=>'<tr><td>'+esc(z.id??'—')+'</td><td>'+esc(z.is_processing===true?'처리 중':z.is_processing===false?'유휴':'—')+'</td><td>'+cnt(z.n_past)+' / '+cnt(z.n_ctx)+'</td><td>'+cnt(z.n_prompt_tokens_processed??z.n_prompt_tokens)+' / '+cnt(z.n_prompt_tokens_cached??z.n_cache_tokens)+'</td><td>'+cnt(z.n_decoded)+'</td></tr>').join('')+'</table>':'<p>'+(meta.host==='0.0.0.0'?'공유 모드: 프롬프트 보호를 위해 슬롯 상세를 비활성화했습니다. 집계 지표는 표시합니다.':'슬롯 상세는 엔진이 제공할 때만 표시합니다.')+'</p>';
  const rt=s.ram_total,rf=s.ram_free,used=rt==null||rf==null?null:Math.max(0,rt-rf);
@@ -1336,7 +1376,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/':return self.send(200,HTML.replace('__TOKEN__',json.dumps(TOKEN)).encode('utf-8'),'text/html; charset=utf-8')
             if self.headers.get('X-Manager-Token')!=TOKEN:return self.send(403,{'error':'invalid manager session token'})
             if self.path=='/api/config':
-                w,l,m,x=paths();form={**BASE['defaults'],'workspace':str(w),'llama_dir':BASE['llama_dir'],'model_dir':BASE['model_dir'],'server_exe':BASE['server_exe'],'build_jobs':BASE['build_jobs'],'cuda_arch':BASE['cuda_arch'],'llama_ref':BASE['llama_ref'],'cuda_root':BASE.get('cuda_root',''),'runtime_cuda':BASE.get('runtime_cuda','12'),'runtime_tag':BASE.get('runtime_tag',''),**SETTINGS};return self.send(200,{'form':form,'model_profiles':BASE['model_profiles']})
+                w,l,m,x=paths();form={**BASE['defaults'],'workspace':str(w),'llama_dir':BASE['llama_dir'],'model_dir':BASE['model_dir'],'server_exe':BASE['server_exe'],'build_jobs':BASE['build_jobs'],'cuda_arch':BASE['cuda_arch'],'llama_ref':BASE['llama_ref'],'cuda_root':BASE.get('cuda_root',''),'runtime_cuda':BASE.get('runtime_cuda','12'),'runtime_tag':BASE.get('runtime_tag',''),**SETTINGS};return self.send(200,{'form':form,'model_profiles':BASE['model_profiles'],'last_ready':LAST_READY})
             if self.path=='/api/status':return self.send(200,status())
             if self.path=='/api/keys':return self.send(200,{'keys':masked_keys(),'locked':bool(task_busy('server') and TASKS['server'].get('meta',{}).get('auth'))})
             if self.path=='/api/addresses':return self.send(200,{'addresses':local_addresses()})
