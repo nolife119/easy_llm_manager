@@ -82,6 +82,46 @@ class SmartFitTest(unittest.TestCase):
         self.assertEqual(m.startup_failure(["CUDA error: out of memory", "failed to create context"])["kind"], "memory")
         self.assertEqual(m.startup_failure(["failed to create context"])["kind"], "context")
 
+    def test_gpu_max_preserves_quant_and_all_gpu(self):
+        d = self.make(context=1048576, purpose="gpu_max", vision=False)
+        p, q = m.profile(d)
+        caps = {"cpu": True, "dynamic": True, "quant_kv": True}
+        out, near, n = m.gpu_context_search(d, p, q["gb"]*1e9/m.GIB, self.hardware(), "auto", "balanced", caps)
+        self.assertTrue(out)
+        self.assertGreater(n, 1)
+        self.assertEqual(out[0]["settings"]["context"], max(c["settings"]["context"] for c in out))
+        for candidate in out:
+            k = candidate["settings"]
+            self.assertEqual(k["quant"], "UD-IQ1_M")
+            self.assertEqual(k["mode"], "gpu")
+            self.assertEqual(k["kv_location"], "gpu")
+            self.assertEqual(k["parallel"], 1)
+            self.assertEqual(k["ram_cache"], 0)
+            self.assertEqual(k["cpu_layers"], 0)
+            self.assertTrue(k["gpu_fast"])
+
+    def test_gpu_max_impossible_does_not_offload(self):
+        d = self.make(purpose="gpu_max")
+        p, q = m.profile(d)
+        out, near, _ = m.gpu_context_search(d, p, q["gb"]*1e9/m.GIB, self.hardware(70), "auto", "balanced",
+                                            {"cpu": True, "dynamic": True, "quant_kv": True})
+        self.assertFalse(out)
+        self.assertGreater(near["deficit"], 0)
+        self.assertEqual(near["settings"]["cpu_layers"], 0)
+
+    def test_gpu_fast_disallows_cpu_kv_override(self):
+        d = self.make(gpu_fast=True, recovery_options='{"--no-kv-offload":true}')
+        with self.assertRaises(ValueError):
+            m.validate(d)
+
+    def test_download_benchmark_isolation(self):
+        with patch.dict(m.TASKS, {"download": {"active": True}}, clear=True):
+            with self.assertRaises(ValueError):
+                m.start_task("benchmark", lambda: None)
+        with patch.dict(m.TASKS, {"benchmark": {"active": True}}, clear=True):
+            with self.assertRaises(ValueError):
+                m.start_task("download", lambda: None)
+
 
 if __name__ == "__main__":
     unittest.main()
