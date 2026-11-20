@@ -1,5 +1,6 @@
 """Local-only Windows llama.cpp manager. Python 3.12, standard library UI."""
 from __future__ import annotations
+import base64, zlib
 import ctypes, fnmatch, hashlib, json, os, re, secrets, shutil, socket, struct, subprocess, sys, tempfile, threading, time, traceback, urllib.request, urllib.error, webbrowser, zipfile
 from collections import deque
 from pathlib import Path
@@ -563,6 +564,9 @@ def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
         if key in seen:continue
         seen.add(key);out.append(item)
         if len(out)>=6:break
+    if out and not any(x['settings']['kv_type']=='f16' for x in out):
+        f16=next((item for _,item in best if item['settings']['kv_type']=='f16'),None)
+        if f16:out.append(f16)
     return out,(nearest[1] if nearest else None),tested
 
 def recommend_setup(raw):
@@ -619,7 +623,7 @@ def recommend_setup(raw):
                  'deficit':near['deficit'] if near else None,'gpu_gap':near['gpu_gap'] if near else None,'ram_gap':near['ram_gap'] if near else None}
         summaries.append(summary)
         if near and (nearest is None or near['deficit']<nearest['deficit']):nearest=near
-        if valid and not installed:
+        if valid and not installed and quant_mode!='quality':
             downloadable.append({'quant':quant,'candidate':candidates[0],'issue':issue or '모델 다운로드 필요'})
         if installed and valid and chosen is None:
             chosen=candidates[0];fallbacks=candidates[1:]
@@ -950,7 +954,7 @@ def launch(raw):
     for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
     with LOCK:
         if d['auth'] and not read_keys():raise ValueError('등록된 API 키가 없습니다.')
-        start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options',''),'engine':str(exe),'settings':{k:d[k] for k in BASE['defaults'] if k in d}})
+        start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options',''),'engine':str(exe),'vision':d['vision'],'batch':d['batch'],'ubatch':d['ubatch'],'settings':{k:d[k] for k in BASE['defaults'] if k in d}})
     return {'started':True}
 
 
@@ -1068,12 +1072,24 @@ def history():
 
 
 def record_bench(kind,meta,result):
-    safe={k:meta[k] for k in ('profile','quant','context','parallel','cpu_layers','expert_cache','cpu_share','kv_type','kv_location') if k in meta}
+    safe={k:meta[k] for k in ('profile','quant','context','parallel','cpu_layers','expert_cache','cpu_share','kv_type','kv_location','vision','batch','ubatch','engine') if k in meta}
     item={'date':time.strftime('%Y-%m-%d %H:%M:%S'),'kind':kind,'settings':safe,**result}
     with LOCK:
         recent=(history()+[item])[-50:];tmp=BENCH_HISTORY.with_suffix('.tmp');tmp.write_text(json.dumps(recent,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(BENCH_HISTORY)
     return item
 
+
+def vision_probe(port,auth,alias):
+    # Synthetic PNG; no user file or remote image request.
+    def chunk(kind,body):
+        return struct.pack('>I',len(body))+kind+body+struct.pack('>I',zlib.crc32(kind+body)&0xffffffff)
+    pixels=(b'\x00'+b'\xff\x00\x00'*224)*224
+    png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',224,224,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(pixels))+chunk(b'IEND',b'')
+    url='data:image/png;base64,'+base64.b64encode(png).decode('ascii')
+    payload={'model':alias,'messages':[{'role':'user','content':[{'type':'text','text':'What is the dominant color? Answer in one word.'},{'type':'image_url','image_url':{'url':url}}]}],'max_tokens':64,'temperature':0,'stream':False}
+    response=api_json(port,'/v1/chat/completions',payload,auth,180)
+    content=response['choices'][0]['message'].get('content','')
+    return {'accepted':True,'correct':bool(re.search(r'\bred\b|빨강|빨간',str(content),re.I)),'answer':str(content)[:200]}
 
 def benchmark(raw):
     with LOCK:
@@ -1082,9 +1098,18 @@ def benchmark(raw):
     if api_json(meta['port'],'/health',auth=meta['auth']).get('status')!='ok':raise ValueError('서버가 아직 준비되지 않았습니다.')
     if meta['parallel']!=1:raise ValueError('기존 사용자 캐시 및 부하에 영향을 주므로 단일 슬롯 서버에서만 벤치마크를 수행하세요.')
     n,m=bench_counts(raw,meta['context'])
+    target=num({'v':raw.get('goal_target',10)},'v',1,1000,False) if raw.get('goal_verify') else None
+    do_vision=bool(raw.get('goal_vision')) and bool(meta.get('settings',{}).get('vision'))
+    if task_busy('benchmark'):raise ValueError('이미 성능 측정 중입니다.')
     def job():
         log('benchmark',f'합성 입력 {n} tokens, 생성 {m} tokens (cache_prompt=false)')
-        result=measure_server(meta['port'],n,m,meta['auth']);item=record_bench('manual',meta,result);set_task_meta('benchmark',result=item)
+        result=measure_server(meta['port'],n,m,meta['auth'])
+        if target is not None:
+            result.update(goal_target=target,goal_pass=result['predicted_per_second']>=target,server_started=t.get('started'),context_configured=meta['context'])
+            if do_vision:
+                try:result['vision_probe']=vision_probe(meta['port'],meta['auth'],meta['alias'])
+                except Exception as exc:result['vision_probe']={'accepted':False,'error':str(exc)}
+        item=record_bench('goal' if target is not None else 'manual',meta,result);set_task_meta('benchmark',result=item)
         log('benchmark',json.dumps(result,ensure_ascii=False))
     start_task('benchmark',job)
 
@@ -1175,6 +1200,18 @@ def diagnostic_command(raw):
     rc,out=run_capture([str(exe),*flags],30,env=env)
     return {'code':rc,'output':out[-120000:],'command':subprocess.list2cmdline([str(exe),*flags])}
 
+def startup_failure(lines):
+    msgtext='\n'.join(lines[-300:]).lower()
+    rules=[
+        ('kv_compat',r'quantized v cache|cache type.*not supported|flash attention.*not supported|flash.attention.*requires|unsupported.*cache type','KV 정밀도/Flash Attention 호환성 오류 후보. 동일 목표에서 F16 후보를 먼저 검토하세요.'),
+        ('model_compat',r'unknown projector|unknown model architecture|key not found in model|error loading model hyperparameters|error loading model architecture','엔진과 모델 또는 projector의 호환성 오류 후보. 메모리 설정만 바꿔도 해결되지 않을 수 있습니다.'),
+        ('memory',r'out of memory|failed to allocate|cannot allocate|cuda error.*memory|cuda_malloc.*fail|not enough memory','메모리 할당 실패 증거가 있습니다. 동일 조건의 낮은 KV/작은 batch/CPU Expert 후보를 검토하세요.'),
+        ('context',r'failed to create context|failed to initialize context|failed to initialize the context','컨텍스트 초기화 실패. 정확한 원인은 이 문구 앞의 로그에서 확인해야 합니다.'),
+    ]
+    for key,pattern,msg in rules:
+        if re.search(pattern,msgtext):return {'kind':key,'message':msg}
+    return {'kind':'unknown','message':'오류 원인을 특정할 수 없습니다. 실패 직전 로그와 실행 명령을 확인하세요.'}
+
 def error_excerpt(lines):
     bad=[]
     for ln in lines:
@@ -1215,7 +1252,7 @@ def status():
         for s in json.loads(slots):
             if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining','n_remain','n_prompt_tokens','n_prompt_tokens_processed','n_prompt_tokens_cached','n_cache_tokens') if k in s})
     except (ValueError,TypeError):pass
-    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys()),'last_ready':LAST_READY}
+    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys()),'last_ready':LAST_READY,'startup_failure':startup_failure(logs['server']) if t.get('state')=='error' else None}
 
 
 def save_prefs(raw):
