@@ -137,3 +137,12 @@ code .
 - [llama.cpp MoE cache](https://github.com/ggml-org/llama.cpp/blob/master/docs/moe-cache.md)
 - [llama.cpp Windows 빌드](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
 - [HF snapshot_download](https://huggingface.co/docs/huggingface_hub/package_reference/file_download)
+
+## v0.2.1 — 서버/다운로드 동시 작업 및 오류 복구
+
+- 다운로드 탭과 서버 실행 탭에서 각각 모델/양자화/vision을 선택합니다. 다운로드를 시작해도 선택한 서버 모델은 바뀌지 않습니다. 다운로드 대상 경로/패턴과 실행 중인 모든 GGUF shard 및 projector를 비교하고 충돌 시 차단합니다. 다른 모델은 다운로드 중에도 실행할 수 있습니다. 외부 프로그램이 파일을 변경하지 않도록 주의하세요. 다운로드는 디스크/RAM 대역폭을 사용하므로 속도가 감소할 수 있습니다. 빌드/자동 튜닝 충돌 제한은 유지됩니다.
+- 서버 실행 탭의 **8K 안전 구동** 프리셋은 선택 모델에 맞는 CPU MoE 층 후보, F16 KV, 8192 context, Expert cache 0을 설정합니다. H100 NVL 두 장 기준의 시작점이며 특히 대형 모델의 OOM을 보장하지 않습니다.
+- **오류 복구 옵션**에 JSON 객체를 입력하면 생성된 명령을 수정합니다. 예: `{"--flash-attn":"off","--no-warmup":true,"--no-kv-unified":null}`. `null`은 기존 옵션 제거, `true`는 단독 스위치 추가, 문자열은 허용된 옵션 값 변경입니다. `{"--no-mmap":true}`는 mmap 비활성화 실험이며 모델 전체 메모리 로딩 때문에 RAM/커밋 한도를 크게 늘릴 수 있으므로 주의하세요. `{"--fit":"on"}`은 엔진이 배치를 변경할 수 있습니다. 복구 옵션을 적용한 경우 예상 메모리와 실제 명령이 다를 수 있어 재확인합니다. 모델/경로/포트/API 키 등은 GUI에서 변경하며 임의 shell 실행을 지원하지 않습니다. 복구 옵션은 저장 시 사용자 설정에 보관되며 초기화 버튼으로 제거할 수 있습니다. 자동 튜닝을 시작하기 전에 비워야 합니다.
+- 모니터링 탭에 최근 실행 요청 오류 및 실패 로그 핵심 줄을 표시합니다. `llama-server --version`, `llama-server --help`, `llama-server --list-devices`, `nvidia-smi`, `nvidia-smi -q`, `nvcc --version`을 진단 명령에 입력해 로컬 출력으로 확인합니다. 별도의 임의 PowerShell 명령은 승인된 터미널에서 직접 실행하세요. 로그를 외부로 보내는 기능은 없습니다.
+- 오류 원인을 확인할 때 마지막 `failed to load model`보다 그 앞의 구체적 오류(예: unknown architecture, allocation failure, assertion)를 우선 확인하세요.
+- Python/JavaScript 구문 확인과 모의 동시 작업 및 복구 옵션 검증을 수행했습니다. 실제 Windows H100 로딩은 검증되지 않았으며 기존 모델 파일의 다운로드 무결성과 엔진 호환성은 별도 확인해야 합니다.
