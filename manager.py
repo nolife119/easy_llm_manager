@@ -392,9 +392,9 @@ def selected_gpus(d,all_g):
     return [by[i] for i in ls]
 
 
-def estimate(raw,hardware=None,weight_override=None):
+def estimate(raw,hardware=None,weight_override=None,fast=False):
     d,p,q=validate(raw); all_g,rt,rf=hardware if hardware is not None else (gpus(),*ram()); gs=selected_gpus(d,all_g); warnings=[]; danger=[]
-    f=resolve_model(d); weight=q['gb']*1e9/GIB
+    f=None if fast else resolve_model(d); weight=q['gb']*1e9/GIB
     if weight_override is not None:weight=weight_override
     elif f and f.exists():
         try:weight=sum(x.stat().st_size for x in check_shards(f))/GIB
@@ -406,6 +406,7 @@ def estimate(raw,hardware=None,weight_override=None):
     kv=2*p['kv_heads']*p['head_dim']*scalar*(full+sliding)/GIB
     # SWA implementation may allocate full length instead; expose worst case.
     worst=2*p['kv_heads']*p['head_dim']*scalar*p['layers']*d['pool']/GIB
+    if recovery_options(d).get('--swa-full') is True:kv=worst
     expert=d['expert_cache']/1024
     gpu=weight-cpu+expert+(kv if d['kv_location']=='gpu' else 0)+d['runtime_reserve']+(2 if d['vision'] else 0)
     # mmap may also keep file pages in RAM, reclaimable; this is mandatory-ish budget, not physical RSS guarantee.
@@ -431,7 +432,7 @@ def estimate(raw,hardware=None,weight_override=None):
     if d['ram_cache']:warnings.append('RAM prompt cache는 유휴/재사용 캐시입니다. 활성 KV 전체를 대체하지 않습니다. 다중 사용자 격리를 검증하세요.')
     if d['context']>=262144:warnings.append('긴 컨텍스트는 prefill 시간, 추가 상태 및 체크포인트 메모리를 크게 증가시킬 수 있습니다.')
     warnings.append('가중치 배치/Expert 비율 및 SWA는 추정치입니다. 프로젝트 파일, CUDA 버퍼, mmap, GPU별 레이어 불균형에 따라 실측이 달라집니다.')
-    return {'weight':weight,'gpu_weight':weight-cpu,'cpu_weight':cpu,'kv':kv,'kv_worst':worst,'gpu':gpu,'host_ram':host,'vfree':vfree,'vtotal':vtotal,'ram_free':rf,'ram_total':rt,'gpu_allocation':per,'ratios':ratios,'gpu_ids':[g['index'] for g in gs],'pool':d['pool'],'warnings':warnings,'danger':danger,'model':str(f or ''),'archive_free':disk(repo_path(d)).get('free')}
+    return {'weight':weight,'gpu_weight':weight-cpu,'cpu_weight':cpu,'kv':kv,'kv_worst':worst,'gpu':gpu,'host_ram':host,'vfree':vfree,'vtotal':vtotal,'ram_free':rf,'ram_total':rt,'gpu_allocation':per,'ratios':ratios,'gpu_ids':[g['index'] for g in gs],'pool':d['pool'],'warnings':warnings,'danger':danger,'model':str(f or ''),'archive_free':None if fast else disk(repo_path(d)).get('free')}
 
 
 def placement_plan(raw):
@@ -500,50 +501,134 @@ def apply_recovery(args,opts):
             if v is not True:args.append(v)
     return args
 
+SMART_KEYS=('profile','quant','model_path','context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split')
+def smart_settings(d):
+    return {k:d[k] for k in SMART_KEYS}
+
+def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
+    """Bounded deterministic search; fixed model/context/slots/vision/KV placement."""
+    gs=selected_gpus(base,hardware[0]);free=sum(g['free'] for g in gs);rf=hardware[2]
+    if not gs or rf is None:return [],None,0
+    moe=p.get('expert_fraction_estimate',0)>0 and caps['cpu']
+    if strategy in ('static','dynamic') and not moe:return [],None,0
+    if strategy=='dynamic' and not caps['dynamic']:return [],None,0
+    types=[precision] if precision!='auto' else ['f16','q8_0','q4_0']
+    types=[t for t in types if t=='f16' or caps['quant_kv']]
+    if not types:return [],None,0
+    normal=max(6,min(24,round(free*.08)))
+    tight=max(4,2*len(gs)+2)
+    levels=list(dict.fromkeys([(normal,512,256),(max(tight,round(normal*.75)),512,128),
+            (max(tight,round(normal*.5)),256,128),(tight,128,64)]))
+    if base['purpose']=='safe':levels=[(normal,256,128),(max(tight,round(normal*.75)),128,64)]
+    if policy=='safe':levels=levels[:2]
+    hosts=sorted({max(8,min(32,round(rf*.10))),max(4,min(12,round(rf*.04)))},reverse=True)
+    if policy=='safe':hosts=hosts[:1]
+    layers=[0] if strategy=='gpu' or not moe else list(range(p['layers']+1))
+    if strategy in ('static','dynamic'):layers=[n for n in layers if n>0]
+    caches=[0] if strategy in ('gpu','static','auto') else [4096,8192,16384,24576]
+    tested=0;best=[];nearest=None
+    for n in layers:
+        for cache in caches:
+            if cache and (not n or cache/1024>weight*p.get('expert_fraction_estimate',0)*n/p['layers']):continue
+            for kt in types:
+                for ri,(reserve,batch,ub) in enumerate(levels):
+                    for hi,host in enumerate(hosts):
+                        d={**base,'mode':'hybrid' if n else 'gpu','cpu_layers':n,'expert_cache':cache,'cpu_share':.5 if cache else 0,
+                           'kv_type':kt,'runtime_reserve':reserve,'ram_reserve':host,'batch':batch,'ubatch':ub}
+                        e=estimate(d,hardware,weight,fast=True);tested+=1
+                        gaps=[g['free']-v for g,v in zip(gs,e['gpu_allocation'])]
+                        vg=e['vfree']-e['gpu'];rg=rf-e['host_ram']
+                        extra=max(0,e['kv_worst']-e['kv'])
+                        swa_risk=(vg if d['kv_location']=='gpu' else rg)<extra-1e-6
+                        deficit=max(0,-vg,max((-x for x in gaps),default=0))+max(0,-rg)
+                        item={'settings':smart_settings(d),'gpu':e['gpu'],'ram':e['host_ram'],'weight':weight,
+                              'gpu_weight':e['gpu_weight'],'cpu_weight':e['cpu_weight'],'kv':e['kv'],'kv_worst':e['kv_worst'],
+                              'gpu_free':e['vfree'],'ram_free':rf,'gpu_gap':vg,'ram_gap':rg,'swa_risk':swa_risk,
+                              'deficit':deficit,'per_gpu':[{'id':g['index'],'free':g['free'],'need':v,'gap':g['free']-v} for g,v in zip(gs,e['gpu_allocation'])],
+                              'warnings':e['warnings'],'danger':e['danger'],'runtime_reserve':reserve,'ram_reserve':host,
+                              'vision_reserve':2 if d['vision'] else 0,'rank':[]}
+                        # Prefer avoiding uncertain full-SWA allocation failures, CPU offload, low KV precision, and then tight buffers.
+                        rank=(int(swa_risk),n,types.index(kt),ri,hi,-cache)
+                        item['rank']=list(rank)
+                        key=(deficit,)+rank
+                        if nearest is None or key<nearest[0]:nearest=(key,item)
+                        memory_errors=[x for x in e['danger'] if 'API 키' not in x]
+                        if deficit>1e-6 or memory_errors:continue
+                        best.append((rank,item))
+    best.sort(key=lambda x:x[0])
+    # Return meaningfully distinct fallbacks, including smaller batches and precision.
+    out=[];seen=set()
+    for _,item in best:
+        d=item['settings'];key=(d['cpu_layers'],d['expert_cache'],d['kv_type'],d['batch'],d['ubatch'])
+        if key in seen:continue
+        seen.add(key);out.append(item)
+        if len(out)>=6:break
+    return out,(nearest[1] if nearest else None),tested
+
 def recommend_setup(raw):
-    """Estimate-only wizard; never starts a server."""
+    """Search current free hardware; no automatic model download, launch or constraint relaxation."""
     p,q=profile(raw)
-    purpose=raw.get('wizard_purpose','coding')
-    location=raw.get('wizard_kv','gpu')
-    strategy=raw.get('wizard_strategy','auto')
-    if purpose not in ('safe','coding','long','team') or location not in ('gpu','cpu') or strategy not in ('auto','gpu','static','dynamic'):
+    purpose=raw.get('wizard_purpose','coding');location=raw.get('wizard_kv','gpu');strategy=raw.get('wizard_strategy','auto')
+    precision=raw.get('wizard_precision','auto');policy=raw.get('wizard_policy','balanced')
+    quant_mode=raw.get('wizard_quant_mode','fixed');target=num({'v':raw.get('wizard_target',10)},'v',1,1000,False)
+    if purpose not in ('safe','coding','long','team') or location not in ('gpu','cpu') or strategy not in ('auto','gpu','static','dynamic') or precision not in ('auto','f16','q8_0','q4_0') or policy not in ('balanced','safe') or quant_mode not in ('fixed','quality','all'):
         raise ValueError('간편 설정 선택을 확인하세요.')
-    if task_busy('server') or task_busy('tune'):
-        raise ValueError('여유 메모리 계산 전 실행/튜닝 중인 서버를 먼저 중지하세요.')
-    gs=gpus(); rt,rf=ram()
-    if not gs or rf is None:
-        raise ValueError('GPU/RAM 자동 감지 실패. 환경 진단을 확인하세요.')
+    if any(task_busy(k) for k in ('server','tune','benchmark','build')):raise ValueError('실행/튜닝/빌드 중인 작업을 중지하고 메모리가 반환된 뒤 계산하세요.')
+    opts=recovery_options(raw)
+    conflicts=set(opts)&{'--cache-type-k','--cache-type-v','--no-kv-offload','--kv-unified','--no-kv-unified','--cache-ram','--n-cpu-moe','--moe-cache-mib','--moe-cache-cpu-share','--mmproj','--no-mmproj','--fit','--flash-attn'}
+    if conflicts:raise ValueError('자동 최적화와 충돌하는 복구 옵션: '+', '.join(sorted(conflicts))+'. 복구 옵션을 초기화하거나 직접 실행하세요.')
+    gs=gpus();rt,rf=ram();hardware=(gs,rt,rf)
+    if not gs or rf is None:return {'ok':False,'message':'GPU/RAM 자동 감지 실패. 환경 진단을 확인하세요.'}
     desired=num({'v':raw.get('wizard_context',32768)},'v',512,p['max_context'])
     slots=num({'v':raw.get('wizard_slots',4)},'v',1,128) if purpose=='team' else 1
-    reserve=max(8,min(32,round(sum(g['free'] for g in gs)*0.08)))
-    host_reserve=max(8,min(32,round(rf*0.10)))
-    d={**raw,'context':desired,'parallel':slots,'unified':False,'pool':desired*slots,
-       'mode':'hybrid','cpu_layers':0,'expert_cache':0,'cpu_share':0,'expert_verbose':False,
-       'kv_location':location,'kv_type':'f16' if purpose=='safe' or location=='cpu' else ('q8_0' if desired>=131072 else 'f16'),
-       'runtime_reserve':reserve,'ram_reserve':host_reserve,'ram_cache':0,'batch':256 if purpose=='safe' else 512,
-       'ubatch':128,'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False)),'gpu_ids':'','split':''}
-    if purpose=='safe' and strategy=='auto':strategy='static'
-    if purpose=='safe':d['vision']=False
-    result=placement_plan(d)
-    static=[x for x in result['candidates'] if x['settings']['expert_cache']==0]
-    dynamic=[x for x in result['candidates'] if x['settings']['expert_cache']>0]
-    if strategy=='gpu': candidates=[x for x in static if x['settings']['cpu_layers']==0]
-    elif strategy=='static':candidates=static
-    elif strategy=='dynamic':candidates=dynamic
-    else:candidates=static or dynamic
-    if strategy=='dynamic':
-        exe=find_server(d)
-        if exe:
-            env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
-            h=engine_help(str(exe),env)
-            if not all(help_has(h,k) for k in ('--moe-cache-mib','--moe-cache-cpu-share')):
-                return {'ok':False,'message':'선택된 엔진에 동적 Expert 캐시 옵션이 없습니다. 정적 CPU Expert 분산을 선택하세요.'}
-    if not candidates:
-        return {'ok':False,'message':'현재 선택 조건에 맞는 메모리 배치가 없습니다. 컨텍스트/슬롯, 양자화 또는 KV 위치를 변경하세요. 요청값을 자동으로 낮추지 않습니다.'}
-    chosen=candidates[0]
-    d.update(chosen['settings'])
-    keys=('context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split')
-    return {'ok':True,'settings':{k:d[k] for k in keys},'candidate':chosen,'message':'현재 여유 메모리 기반 추천값입니다. 실측 성공/속도를 보장하지 않습니다. 기존 접속/인증/복구 옵션 유지.'}
+    d={**BASE['defaults'],**raw,'purpose':purpose,'context':desired,'parallel':slots,'unified':False,'pool':desired*slots,
+       'mode':'gpu','cpu_layers':0,'expert_cache':0,'cpu_share':0,'expert_verbose':False,'kv_location':location,
+       'kv_type':'f16','ram_cache':0,'runtime_reserve':8,'ram_reserve':8,'batch':256,'ubatch':128,
+       'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False))}
+    # Keep explicitly selected GPUs and split; do not silently switch devices.
+    selected=selected_gpus(d,gs)
+    if not selected or any(g['free']<=0 for g in selected):return {'ok':False,'message':'선택 GPU에 여유 VRAM이 없습니다.'}
+    exe=find_server(d)
+    if not exe:return {'ok':False,'message':'llama-server 실행 파일을 환경에서 지정하세요.'}
+    env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
+    h=engine_help(str(exe),env)
+    caps={'cpu':help_has(h,'--n-cpu-moe'),'dynamic':all(help_has(h,k) for k in ('--moe-cache-mib','--moe-cache-cpu-share','--n-cpu-moe')),
+          'quant_kv':all(help_has(h,k) for k in ('--cache-type-k','--cache-type-v','--flash-attn'))}
+    if d['vision'] and not help_has(h,'--mmproj'):return {'ok':False,'message':'선택 엔진은 Vision projector 옵션을 지원하지 않습니다.'}
+    if strategy=='dynamic' and not caps['dynamic']:return {'ok':False,'message':'선택 엔진에 동적 Expert 캐시 옵션이 없습니다. 정적 또는 GPU 배치를 선택하세요.'}
+    if strategy=='static' and not caps['cpu']:return {'ok':False,'message':'선택 엔진은 CPU Expert 분산 옵션을 지원하지 않습니다.'}
+    if location=='cpu' and not help_has(h,'--no-kv-offload'):return {'ok':False,'message':'선택 엔진은 CPU KV 옵션을 지원하지 않습니다.'}
+    if precision in ('q8_0','q4_0') and not caps['quant_kv']:return {'ok':False,'message':'선택 엔진은 양자화 KV 옵션을 지원하지 않습니다.'}
+    # Explicit quality ordering uses weight size as proxy, not a measured quality/throughput ranking.
+    quants=[d['quant']] if quant_mode=='fixed' else sorted(p['quants'],key=lambda k:p['quants'][k]['gb'],reverse=True)
+    summaries=[];chosen=None;fallbacks=[];downloadable=[];nearest=None;tested=0
+    for quant in quants:
+        trial={**d,'quant':quant,'model_path':d.get('model_path','') if quant==d['quant'] else ''}
+        f=resolve_model(trial);installed=False;weight=p['quants'][quant]['gb']*1e9/GIB;issue=''
+        if f:
+            try:
+                shards=check_shards(f);weight=sum(x.stat().st_size for x in shards)/GIB;installed=True
+            except (ValueError,OSError) as exc:issue=str(exc)
+        projector=p.get('projector')
+        if trial['vision']:
+            paths_to_check=([repo_path(trial)/projector,f.parent/projector,f.parent.parent/projector] if f and projector else [repo_path(trial)/projector] if projector else [])
+            if not any(x.is_file() for x in paths_to_check):installed=False;issue='Vision projector가 없습니다.'
+        candidates,near,count=smart_search(trial,p,weight,hardware,strategy,precision,policy,caps);tested+=count
+        valid=bool(candidates)
+        summary={'quant':quant,'installed':installed,'feasible':valid,'issue':issue,'weight':weight,
+                 'deficit':near['deficit'] if near else None,'gpu_gap':near['gpu_gap'] if near else None,'ram_gap':near['ram_gap'] if near else None}
+        summaries.append(summary)
+        if near and (nearest is None or near['deficit']<nearest['deficit']):nearest=near
+        if valid and not installed:
+            downloadable.append({'quant':quant,'candidate':candidates[0],'issue':issue or '모델 다운로드 필요'})
+        if installed and valid and chosen is None:
+            chosen=candidates[0];fallbacks=candidates[1:]
+    result={'ok':bool(chosen),'tested':tested,'models':summaries,'target_tps':target,'downloadable':downloadable[:4],
+            'candidate':chosen or nearest,'alternatives':fallbacks,'hardware':{'gpus':selected,'ram_total':rt,'ram_free':rf},
+            'message':'추정상 가능한 설정을 찾았습니다. 속도와 실제 초기화는 벤치마크 전까지 미검증입니다.' if chosen else '고정한 조건으로 설치된 모델의 실행 가능 후보를 찾지 못했습니다. 아래 부족량과 다운로드 후보를 확인하세요.'}
+    if chosen:result['settings']=chosen['settings']
+    return result
+
 
 def command_preview(raw):
     d,p,q=validate(raw); e=estimate(d); exe=find_server(d); f=resolve_model(d)
@@ -1143,7 +1228,7 @@ def save_prefs(raw):
 
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inkling Manager</title><style>
 :root{color-scheme:dark;--bg:#10151d;--panel:#19222e;--line:#344253;--fg:#edf2f7;--muted:#a5b5c7;--accent:#68d6b4;--warn:#f4be72}*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);font:14px/1.55 'Segoe UI',system-ui,sans-serif;margin:0}header{padding:22px max(24px,calc((100vw - 1260px)/2));background:#151e29;border-bottom:1px solid var(--line)}h1{margin:0;font-size:25px;letter-spacing:-.5px}h2{font-size:18px;margin:0 0 14px}h3{font-size:15px;margin:15px 0 8px}p{margin:8px 0;color:var(--muted)}main{max-width:1260px;margin:auto;padding:18px 24px 50px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}button,a.btn{border:1px solid var(--line);border-radius:7px;background:#253445;color:var(--fg);padding:9px 13px;font:inherit;cursor:pointer;text-decoration:none}button:hover{border-color:var(--accent)}button.active,button.primary{background:var(--accent);color:#0b211b;border-color:var(--accent);font-weight:650}button:disabled{opacity:.4;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:12px}.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}.panel{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:18px;margin-bottom:14px}.field{display:flex;flex-direction:column;gap:5px;margin:0 0 9px;min-width:0}.field>span{color:#c4d0df;font-size:13px}.field small{color:var(--muted)}input,select{width:100%;padding:9px 10px;background:#111923;color:var(--fg);border:1px solid var(--line);border-radius:6px;font:inherit;min-width:0}input[type=checkbox]{width:auto;margin-right:8px}label.check{display:flex;align-items:center;padding:8px 0}input:focus,select:focus{outline:1px solid var(--accent)}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.good{color:var(--accent)}.bad{color:#ff9992}.warn{color:var(--warn)}.muted{color:var(--muted)}.metric{background:#121b25;padding:13px;border-radius:8px;border:1px solid #2b3949}.metric b{display:block;font-size:23px;line-height:1.4;font-variant-numeric:tabular-nums}.bar{height:9px;background:#354254;border-radius:6px;overflow:hidden;margin:7px 0}.bar i{display:block;height:100%;background:var(--accent)}pre{background:#0c131c;border-radius:7px;padding:13px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:12px/1.55 Consolas,monospace;margin:8px 0}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left;overflow-wrap:anywhere}th{color:var(--muted)}a{color:#9cc9ff}.hidden{display:none!important}#toast{position:fixed;bottom:18px;right:18px;max-width:min(600px,95vw);background:#2c4252;border:1px solid #597a8d;border-radius:8px;padding:12px 16px;z-index:9;white-space:pre-wrap}#toast:empty{display:none}.lead{font-size:13px;color:var(--muted)}@media(max-width:850px){.cols{grid-template-columns:1fr}main{padding:12px}.panel{padding:13px}} .studio{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(290px,.8fr);gap:16px;align-items:start}.stage{border-top:1px solid var(--line);padding:16px 0}.stage:first-of-type{border-top:0}.stage h3{margin:0 0 10px}.eyebrow{font-size:12px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em}.hero{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.hero h2{margin:0}.large-metric b{font-size:34px}.large-metric{min-height:102px}.dashgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.inline-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline-controls input,.inline-controls select{width:auto;max-width:100%}.inline-controls input[type=search]{flex:1;min-width:130px}.logview{height:440px;max-height:none;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.logview .errorline{color:#ffaaa5}.logview .warnline{color:#f4be72}.logview .timingline{color:#a6e7d3}.logview .line{display:block}.spark{width:100%;height:115px;display:block}.pillstatus{font-weight:650;border:1px solid var(--line);border-radius:999px;padding:5px 12px;white-space:nowrap}.mini-note{font-size:12px;color:var(--muted)}.sticky{position:sticky;top:12px}details>summary{cursor:pointer;font-weight:650;padding:10px 0}textarea{font:inherit} @media(max-width:900px){.studio{grid-template-columns:1fr}.sticky{position:static}} </style></head><body>
-<header><h1>Easy LLM Manager v0.4 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
+<header><h1>Easy LLM Manager v0.4.1 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
 <section id="env" class="tab"><div class="cols"><div class="panel"><h2>환경 진단</h2><p>먼저 GPU와 필수 도구를 확인하세요. 설치 직후 PATH가 갱신되지 않았다면 이 도구를 다시 실행하세요.</p><div class="buttons"><button class="primary" onclick="diagnose()">환경 다시 검사</button><button onclick="act('install_hf',{})">HF 다운로드 도구 설치</button></div><div id="diagnosis"></div></div><div class="panel"><h2>저장 경로</h2><p>기존 AI 폴더 또는 여유 공간이 큰 고정 디스크를 탐색합니다. 필요하면 직접 수정하세요.</p><div id="pathFields"></div><div class="buttons"><button onclick="save()">경로/세팅 저장</button></div><p>모델, 빌드 결과는 작업 폴더에 저장합니다. 개인 설정과 API 키는 사용자 전용 데이터 폴더에 저장합니다.</p></div></div></section>
 <section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><p>다운로드 선택은 서버 설정과 독립적입니다. 실행 중인 동일 파일은 보호됩니다.</p><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect',downloadForm())">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
 <section id="build" class="tab hidden"><div class="cols"><div class="panel"><h2>llama.cpp 엔진 관리 · CUDA 빌드</h2><p>이미 체크아웃한 호환 브랜치가 있다면 아래 버튼을 사용하세요. 기존 소스를 업데이트하지 않습니다.</p><div class="buttons"><button onclick="scanEngines()">소스 및 실행 파일 검색</button><button class="primary" onclick="buildCurrent()">현재 체크아웃 그대로 빌드</button></div><div id="engineList"></div><details><summary>일반 빌드 / 공식 바이너리 설치</summary><p>기존 소스를 재사용하고 없다면 공식 Git 저장소에서 clone합니다. Visual Studio C++ 빌드 도구와 CUDA Toolkit이 필요합니다.</p><div id="buildFields"></div><h3>공식 사전 컴파일 바이너리 (컴파일 대안)</h3><div id="runtimeFields"></div><div class="buttons"><button onclick="installBinary()">공식 CUDA 바이너리 설치</button><button onclick="useInstalled()">설치/빌드 결과 실행 파일 적용</button></div><p>GitHub 공식 릴리스만 사용합니다. CUDA 12/13은 드라이버와 호환되는 버전을 선택하세요.</p><label class="check"><input type="checkbox" id="fresh_build">새 빌드 폴더 사용 (기존 파일 유지)</label><label class="check"><input type="checkbox" id="update_source">기존 소스 업데이트 (변경사항이 없을 때만)</label><div class="buttons"><button class="primary" onclick="act('build')">컴파일 시작</button><button onclick="stop('build')">중지</button></div><p>H100은 CUDA arch 90. Git ref를 지정하면 해당 버전으로 빌드합니다. 최초 빌드는 오래 걸릴 수 있습니다.</p></details></div><div class="panel"><h2>빌드 로그</h2><pre id="buildLog"></pre><p>오류 시 마지막 로그와 환경 진단을 확인하세요. 기존 CMake 생성기와 충돌한다면 소스를 보존하고 build 폴더만 이름을 변경한 후 다시 빌드하세요.</p></div></div></section>
