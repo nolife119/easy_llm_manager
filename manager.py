@@ -1226,15 +1226,97 @@ async function preflightKeys(){try{const r=await api('keys');keyCount=r.keys.len
 function restoreActive(){const m=prev?.tasks?.server?.meta;if(!m?.settings){toast('이 버전에서 실행한 설정 기록이 아직 없습니다. 저장된 설정으로 시작하세요.');return}if(!confirm('최근 실행 요청의 모델/성능 설정을 복원할까요? 접속 및 인증 설정은 유지합니다.'))return;const keep={host:form.host,port:form.port,auth:form.auth};Object.assign(form,m.settings,keep,{server_exe:m.engine||form.server_exe});wizardPrefs=null;render();toast('최근 실행 설정 복원 완료')}
 
 function logs(id,items,follow=true){const x=$(id),v=items.join('\n');if(x.textContent!==v){x.textContent=v;if(follow)x.scrollTop=x.scrollHeight}}
-function rateMetrics(m){let out=[];for(const ln of m.split('\n')){if(ln.startsWith('#'))continue;const z=ln.match(/^([^\s{]+)(?:\{[^}]*\})?\s+([\d.eE+\-]+)$/);if(z&&/tokens_per_second|requests_processing|requests_deferred|kv_cache_usage|predicted_tokens_total|prompt_tokens_total/.test(z[1]))out.push(metric(z[1].replace(/^llamacpp:/,''),fmt(Number(z[2]))))}return out.slice(0,12).join('')}
-async function poll(){if(polling||!config)return;polling=true;try{let s=await api('status');prev=s;let st=s.tasks.server;let total=s.gpu.reduce((a,g)=>a+g.total,0),used=s.gpu.reduce((a,g)=>a+g.used,0);$('summary').innerHTML=metric('GPU VRAM',fmt(used)+' / '+fmt(total)+' GiB',`${s.gpu.length} GPU`)+metric('RAM 여유',fmt(s.ram_free)+' GiB','전체 '+fmt(s.ram_total)+' GiB')+metric('추론 서버',st?.active?(s.health?'응답 중':'시작/로딩 중'):(st?.state||'미실행'),st?.pid?'PID '+st.pid:'');$('gpuCards').innerHTML=s.gpu.map(g=>`<div class="metric"><small>GPU ${g.index} · ${esc(g.name)}</small><b>${fmt(g.used)} / ${fmt(g.total)} GiB</b><div class="bar"><i style="width:${Math.min(100,g.used/g.total*100)}%"></i></div><small>GPU ${fmt(g.util)}% · ${fmt(g.temp)}°C · ${fmt(g.power)}W</small></div>`).join('')||'<p>GPU 미감지</p>';$('taskCards').innerHTML=['download','build','server','benchmark','tune'].map(k=>metric(k,s.tasks[k]?.state||'idle',s.tasks[k]?.pid?'PID '+s.tasks[k].pid:'')).join('');$('health').textContent=s.health||'서버 health 응답 없음';logs('downloadLog',s.logs.download);logs('buildLog',s.logs.build);logs('serverLog',s.logs.server,$('follow').checked);$('serverErrors').textContent=(s.server_errors||[]).join('\n')||'—';$('metrics').textContent=s.metrics||'metrics 응답 없음';$('slots').textContent=JSON.stringify(s.slots,null,2);$('rates').innerHTML=rateMetrics(s.metrics)+(s.cache_stats?.samples?metric('Expert cache hit (최근 로그)',fmt(s.cache_stats.hit_rate)+'%',s.cache_stats.samples+' samples'):metric('Expert cache hit','—','지원 로그가 있을 때만 표시'));benchView(s);let b=s.tasks.build;if(b?.state==='done'&&b.meta?.apply&&b.meta?.exe&&appliedBuild!==b.meta.exe){appliedBuild=b.meta.exe;form.server_exe=b.meta.exe;render();await save();toast('현재 체크아웃 빌드 완료 · 실행 파일 적용');if(current==='build')scanEngines()}if(st?.active)connection(st.meta)}catch(e){$('health').textContent=e.message}finally{polling=false}}
+let trend=[],prevSample=null,lastServerRun=null,filteredLogs=[],logSignature='';
+const cnt=v=>v==null?'—':Math.round(v).toLocaleString();
+const numRate=v=>v==null?'—':Number(v).toFixed(1)+' t/s';
+function parseMetrics(text){
+ const out={};
+ for(const ln of String(text||'').split('\n')){
+  const m=ln.trim().match(/^([^\s{#]+)\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)(?:\s+\d+)?$/);
+  if(m&&Number.isFinite(Number(m[2])))out[m[1].replace(/^llamacpp:/,'')]=Number(m[2]);
+ }
+ return out;
+}
+function getMetric(m,...names){for(const n of names)if(Object.hasOwn(m,n)&&Number.isFinite(m[n]))return m[n];return null}
+function timingLogs(lines){
+ const result={prompt:null,decode:null,promptN:null,decodeN:null,promptLine:'',decodeLine:''};
+ for(const ln of lines||[]){
+  const m=ln.match(/(prompt eval time|(?<!prompt )eval time)\s*=\s*[\d.]+\s*ms\s*\/\s*(\d+)\s*(?:tokens|runs)[^)]*?([\d.]+)\s*tokens per second/i);
+  if(!m)continue;
+  const k=m[1].toLowerCase().startsWith('prompt')?'prompt':'decode';
+  result[k]=Number(m[3]);result[k+'N']=Number(m[2]);result[k+'Line']=ln.slice(0,8);
+ }
+ return result;
+}
+function healthy(s){try{return JSON.parse(s.health).status==='ok'}catch{return false}}
+function spark(id,key){
+ const target=$(id),vals=trend.map(x=>x[key]).filter(x=>x!==null&&Number.isFinite(x));
+ if(!vals.length){target.innerHTML='<p>아직 처리량 표본이 없습니다.</p>';return}
+ const max=Math.max(1,...vals),w=310,h=100;
+ const x=i=>10+(w-20)*i/Math.max(1,trend.length-1),y=v=>h-10-(h-20)*v/max;
+ let segments=[],seg=[];
+ trend.forEach((z,i)=>{if(z[key]==null){if(seg.length)segments.push(seg);seg=[]}else seg.push([x(i),y(z[key])])});if(seg.length)segments.push(seg);
+ const color=key==='prompt'?'#78aef4':'#68d6b4';
+ target.innerHTML='<svg class="spark" viewBox="0 0 '+w+' '+h+'" role="img" aria-label="최근 처리량 그래프"><path d="M10 90H300 M10 50H300 M10 10H300" stroke="#344253" stroke-dasharray="3 3" fill="none"/>'+segments.map(p=>p.length===1?'<circle cx="'+p[0][0]+'" cy="'+p[0][1]+'" r="3" fill="'+color+'"/>':'<polyline points="'+p.map(v=>v.join(',')).join(' ')+'" fill="none" stroke="'+color+'" stroke-width="2.5" stroke-linejoin="round"/>').join('')+'</svg><div class="mini-note">최고 '+numRate(max===1&&Math.max(...vals)<1?Math.max(...vals):max)+' · '+vals.length+'개 유효 표본</div>';
+}
+function bigMetric(k,v,h){return '<div class="metric large-metric"><small>'+esc(k)+'</small><b>'+esc(v)+'</b><small>'+esc(h)+'</small></div>'}
+function renderDashboard(s){
+ const st=s.tasks.server||{},meta=st.meta||{},ready=healthy(s),active=!!st.active,run=st.started||null;
+ if(run!==lastServerRun){lastServerRun=run;trend=[];prevSample=null;logSignature=''}
+ const m=parseMetrics(s.metrics),log=timingLogs(s.logs.server);
+ const ptotal=getMetric(m,'prompt_tokens_total'),dtotal=getMetric(m,'tokens_predicted_total','predicted_tokens_total');
+ const pg=getMetric(m,'prompt_tokens_seconds','prompt_tokens_per_second'),dg=getMetric(m,'predicted_tokens_seconds','predicted_tokens_per_second');
+ const processing=getMetric(m,'requests_processing'),queued=getMetric(m,'requests_deferred'),kv=getMetric(m,'kv_cache_usage_ratio','kv_cache_usage');
+ const pk=getMetric(m,'kv_cache_tokens','kv_cache_tokens_total'),maxctx=getMetric(m,'n_tokens_max');
+ const now=Number(s.sample_time)||Date.now()/1000;
+ // Counter changes are observed wall-clock work, not a per-request generation benchmark.
+ let liveP=null,liveD=null;
+ if(active&&ready&&prevSample&&now>prevSample.t&&now-prevSample.t<=15){
+  const rate=(a,b)=>a==null||b==null||a<b?null:(a-b)/(now-prevSample.t);
+  liveP=rate(ptotal,prevSample.p);liveD=rate(dtotal,prevSample.d);
+ }
+ if(active&&ready){prevSample={t:now,p:ptotal,d:dtotal};trend.push({t:now,prompt:liveP,decode:liveD});trend=trend.filter(z=>now-z.t<=120).slice(-40)}else prevSample=null;
+ const cached=s.cache_stats||{};
+ const phase=active?(ready?'서비스 준비 완료':(st.pid?'모델 로딩 / 초기화':'서버 시작 요청 중')):st.state==='error'?'실행 실패':st.state==='stopped'?'중지됨':'미실행';
+ $('monitorState').textContent=phase;$('monitorState').className=ready?'good':st.state==='error'?'bad':'';
+ $('monitorMeta').textContent=(meta.quant||'모델 미선택')+' · '+(meta.host||'—')+':'+(meta.port||'—')+' · '+(meta.auth?'API 키 인증':'인증 없음')+(st.pid?' · PID '+st.pid:'')+(active&&st.started?' · '+Math.max(0,Math.round(now-st.started))+'초 경과':'');
+ $('health').textContent=ready?'Health OK · 새 요청 수신 가능':active?'Health 준비 대기 중':st.state==='error'?'아래 실패 로그를 확인하세요.':'';
+ const perf=(g,l)=>g!=null&&g>0?g:l!=null?l:g;
+ const src=(g,l,line)=>g!=null&&g>0?'엔진 보고 평균':l!=null?'최근 요청 완료 로그 '+line:g!=null?'엔진 보고값':'지원 지표 없음';
+ const pv=perf(pg,log.prompt),dv=perf(dg,log.decode);
+ $('throughput').innerHTML=bigMetric('입력 처리 · Prefill',numRate(pv),src(pg,log.prompt,log.promptLine))+bigMetric('출력 생성 · Decode',numRate(dv),src(dg,log.decode,log.decodeLine))+bigMetric('누적 처리 입력',cnt(ptotal),ptotal==null?'최근 입력 로그: '+cnt(log.promptN):'서버 카운터 · tokens')+bigMetric('누적 생성 출력',cnt(dtotal),dtotal==null?'최근 출력 로그: '+cnt(log.decodeN):'서버 카운터 · tokens')+bigMetric('현재 구간 입력',numRate(liveP),'카운터 변화 / 실제 경과 시간')+bigMetric('현재 구간 출력',numRate(liveD),'완료 시 갱신되는 엔진은 계단형');
+ spark('promptTrend','prompt');spark('decodeTrend','decode');
+ $('metricSource').textContent=s.metrics?'그래프: 최근 조회 사이 누적 토큰 카운터 변화 / 경과 시간. 완료 요청 단위 갱신이면 순간 속도와 다릅니다. 상단 평균 t/s는 엔진 또는 완료 로그 값입니다.':'/metrics 미응답 또는 미지원. 상단은 완료 로그에서 확인 가능한 값만 표시하며 그래프와 누적 지표는 비어 있을 수 있습니다.';
+ $('rates').innerHTML=metric('처리 중',cnt(processing),'요청')+metric('대기 중',cnt(queued),'요청')+metric('KV 점유율',kv==null?'—':(kv*100).toFixed(1)+'%',kv==null?'엔진 미보고':'엔진 측정값')+metric('KV 저장 토큰',cnt(pk),'엔진 제공 시')+metric('최대 관측 컨텍스트',cnt(maxctx),'엔진 high watermark')+metric('Expert cache hit',cached.hit_rate==null?'—':fmt(cached.hit_rate)+'%',cached.samples?cached.samples+'개 최근 로그 표본':'지원 로그 없음')+metric('Expert hit / miss',cached.samples?cnt(cached.hits)+' / '+cnt(cached.misses):'—',cached.samples?'CPU miss '+cnt(cached.cpu):'비활성 또는 로그 미지원')+metric('Expert 업로드',cached.samples?fmt(cached.uploaded_mib)+' MiB':'—','최근 로그 누적');
+ const slots=s.slots||[];
+ $('slotDisplay').innerHTML=slots.length?'<h3>슬롯별 현황</h3><table><tr><th>ID</th><th>상태</th><th>컨텍스트</th><th>입력 처리/캐시</th><th>생성</th></tr>'+slots.map(z=>'<tr><td>'+esc(z.id??'—')+'</td><td>'+esc(z.is_processing===true?'처리 중':z.is_processing===false?'유휴':'—')+'</td><td>'+cnt(z.n_past)+' / '+cnt(z.n_ctx)+'</td><td>'+cnt(z.n_prompt_tokens_processed??z.n_prompt_tokens)+' / '+cnt(z.n_prompt_tokens_cached??z.n_cache_tokens)+'</td><td>'+cnt(z.n_decoded)+'</td></tr>').join('')+'</table>':'<p>'+(meta.host==='0.0.0.0'?'공유 모드: 프롬프트 보호를 위해 슬롯 상세를 비활성화했습니다. 집계 지표는 표시합니다.':'슬롯 상세는 엔진이 제공할 때만 표시합니다.')+'</p>';
+ const rt=s.ram_total,rf=s.ram_free,used=rt==null||rf==null?null:Math.max(0,rt-rf);
+ $('ramCard').innerHTML=metric('시스템 RAM 사용',used==null?'—':fmt(used)+' / '+fmt(rt)+' GiB','파일 캐시와 공유 메모리 포함 가능 · 여유 '+fmt(rf)+' GiB')+(used==null?'':'<div class="bar"><i style="width:'+Math.min(100,100*used/rt)+'%"></i></div>');
+ $('errorBanner').innerHTML=st.state==='error'?'<p class="bad">실행 실패: '+esc((s.server_errors||[]).slice(-1)[0]||'로그를 확인하세요.')+'</p>':'';
+ $('metrics').textContent=s.metrics||'미지원 / 응답 없음';$('slots').textContent=JSON.stringify(slots,null,2);$('serverErrors').textContent=(s.server_errors||[]).join('\n')||'—';
+ renderServerLog();setupSummary();
+}
+function renderServerLog(){
+ const lines=prev?.logs?.server||[],query=$('logSearch').value.toLowerCase().trim(),mode=$('logFilter').value;
+ const error=/\b(error|fatal|failed|assert|exception|warn|warning)\b|out of memory|오류|실패|자동 진단|종료 코드/i;
+ const timing=/tokens.per.second|eval time|prompt|cache|decode|prefill|timing|토큰/i;
+ const loading=/load|tensor|gguf|memory|alloc|buffer|init|리스닝|listening/i;
+ filteredLogs=lines.filter(ln=>(!query||ln.toLowerCase().includes(query))&&(mode==='all'||(mode==='errors'?error:mode==='timing'?timing:loading).test(ln)));
+ const signature=JSON.stringify([mode,query,filteredLogs]);if(signature===logSignature)return;logSignature=signature;
+ const box=$('serverLog'),atBottom=$('follow').checked,old=box.scrollTop;
+ box.innerHTML=filteredLogs.map(ln=>'<span class="line '+(error.test(ln)?(/warn/i.test(ln)?'warnline':'errorline'):timing.test(ln)?'timingline':'')+'">'+esc(ln)+'</span>').join('');
+ $('logCount').textContent=filteredLogs.length+' / '+lines.length+'줄 · 최근 로그';
+ if(atBottom)box.scrollTop=box.scrollHeight;else box.scrollTop=old;
+}
+function copyServerLog(){copyText(filteredLogs.join('\n'))}
+async function poll(){if(polling||!config)return;polling=true;try{let s=await api('status');prev=s;let st=s.tasks.server;let total=s.gpu.reduce((a,g)=>a+g.total,0),used=s.gpu.reduce((a,g)=>a+g.used,0);$('summary').innerHTML=metric('GPU VRAM',fmt(used)+' / '+fmt(total)+' GiB',`${s.gpu.length} GPU`)+metric('RAM 여유',fmt(s.ram_free)+' GiB','전체 '+fmt(s.ram_total)+' GiB')+metric('추론 서버',st?.active?(healthy(s)?'응답 중':'시작/로딩 중'):(st?.state||'미실행'),st?.pid?'PID '+st.pid:'');$('gpuCards').innerHTML=s.gpu.map(g=>`<div class="metric"><small>GPU ${g.index} · ${esc(g.name)}</small><b>${fmt(g.used)} / ${fmt(g.total)} GiB</b><div class="bar"><i style="width:${Math.min(100,g.used/g.total*100)}%"></i></div><small>GPU ${fmt(g.util)}% · ${fmt(g.temp)}°C · ${fmt(g.power)}W</small></div>`).join('')||'<p>GPU 미감지</p>';$('taskCards').innerHTML=['download','build','server','benchmark','tune'].map(k=>metric(k,s.tasks[k]?.state||'idle',s.tasks[k]?.pid?'PID '+s.tasks[k].pid:'')).join('');logs('downloadLog',s.logs.download);logs('buildLog',s.logs.build);keyCount=s.key_count??keyCount;const locked=!!(st?.active&&st.meta?.auth);if(keyLocked!==locked){keyLocked=locked;drawKeys(knownKeys)}renderDashboard(s);benchView(s);let b=s.tasks.build;if(b?.state==='done'&&b.meta?.apply&&b.meta?.exe&&appliedBuild!==b.meta.exe){appliedBuild=b.meta.exe;form.server_exe=b.meta.exe;render();await save();toast('현재 체크아웃 빌드 완료 · 실행 파일 적용');if(current==='build')scanEngines()}connection()}catch(e){$('health').textContent=e.message}finally{polling=false}}
 async function keys(){await guard(async()=>{let r=await api('keys');knownKeys=r.keys;keyCount=r.keys.length;keyLocked=r.locked;drawKeys(r.keys);setupSummary()})}
 function drawKeys(a){$('authState').innerHTML=metric('등록된 키',a.length,keyLocked?'인증 서버 실행 중 · 변경 잠김':'발급 / 회수 가능');$('addKey').disabled=keyLocked;$('keyList').innerHTML=a.length?'<table><tr><th>API 키 (마스킹)</th><th>관리</th></tr>'+a.map(x=>'<tr><td>'+esc(x.mask)+'</td><td><button '+(keyLocked?'disabled ':'')+'onclick="key(\'remove\','+x.index+')">회수</button></td></tr>').join('')+'</table>':'<p>등록된 키 없음</p>'}
 let keyBusy=false;
 async function key(action,index){if(keyBusy||keyLocked)return;if(action==='remove'&&!confirm('이 키를 회수할까요? 복구할 수 없습니다.'))return;keyBusy=true;try{let r=await api('key',{action,index,expected:knownKeys.find(x=>x.index===index)?.mask});knownKeys=r.keys;keyCount=r.keys.length;drawKeys(r.keys);setupSummary();$('newKey').innerHTML='';if(r.new){$('newKey').innerHTML='<div class="metric"><p class="warn">새 키 · 지금 복사하여 안전하게 보관하세요.</p><pre></pre><div class="buttons"><button onclick="copyText(this.parentElement.previousElementSibling.textContent)">복사</button><button onclick="this.closest(\'.metric\').remove()">숨기기</button></div></div>';$('newKey').querySelector('pre').textContent=r.new}toast('키 변경 완료 · 다음 인증 서버 시작 시 적용')}catch(e){toast(e.message)}finally{keyBusy=false}}
 async function testAccess(){await guard(async()=>{const r=await api('probe_access',{});const pass=r.auth&&[401,403].includes(r.without_key)&&r.with_key===200;$('accessTest').textContent='Health: '+(r.health??'응답 없음')+'\n/v1/models (키 없음): '+(r.without_key??'응답 없음')+'\n/v1/models (등록 키): '+(r.with_key??'미사용')+'\n'+(pass?'이 엔드포인트의 키 인증 정상 확인':r.auth?'인증 확인 필요: 이 엔드포인트 결과만으로 전체 API 접근 차단을 보장하지 않습니다.':'현재 인증 꺼짐')+'\n서버 내부 테스트입니다. 다른 노트북의 방화벽/네트워크는 별도 확인하세요.'})}
 
-(async()=>{try{config=await api('config');form=config.form;dl={profile:form.profile,quant:form.quant,vision:form.vision};render();tab('env');diagnose();poll();setInterval(poll,3000)}catch(e){toast(e.message)}})();
+(async()=>{try{config=await api('config');form=config.form;dl={profile:form.profile,quant:form.quant,vision:form.vision};if(form.host==='0.0.0.0')form.auth=true;render();tab('run');poll();setInterval(poll,3000)}catch(e){toast(e.message)}})();
 </script></body></html>'''
 
 
