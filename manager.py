@@ -746,6 +746,7 @@ def command_preview(raw):
         if d['spec_mode']=='draft-dspark':
             draft=absolute(d['draft_path'])
             if not draft.is_file() or draft.suffix.lower()!='.gguf' or draft==f:raise ValueError('별도의 호환 가능한 DSpark GGUF를 지정하세요.')
+            check_shards(draft)
             d['draft_path']=str(draft)
             e['warnings'].append('DSpark 가중치/KV/검증 버퍼는 배치 추정에 포함되지 않습니다. 실제 초기화를 확인하세요.')
         if d['split_mode']!='layer':e['warnings'].append('변경된 GPU 분배 모드의 실제 GPU별 배치와 호환성은 추정할 수 없습니다.')
@@ -1048,7 +1049,7 @@ def launch(raw):
     arch=md.get('general.architecture')
     if arch and d['profile']=='inkling2' and arch!='inkling2':raise ValueError('선택한 파일이 Inkling 2 언어 모델이 아닙니다: '+str(arch))
     if '--mmproj' in args:files.append(str(Path(args[args.index('--mmproj')+1]).resolve()))
-    if d['spec_mode']=='draft-dspark':files+=list(map(str,check_shards(absolute(d['draft_path']))))
+    if d['spec_mode']=='draft-dspark':files += [str(x.resolve()) for x in check_shards(absolute(d['draft_path']))]
     if d['auth'] and not read_keys():raise ValueError('API 키를 먼저 생성하세요. API 키 탭에서 생성한 다음 실행하세요.')
     if not e['gpu_ids']:raise ValueError('사용할 NVIDIA GPU가 없습니다.')
     with socket.socket() as s:
@@ -1343,11 +1344,11 @@ def speed_info(raw):
 def speed_sample(port,workload,n,m,auth=False):
     # Distinct synthetic code-edit and explanation tasks. Never read user files or send external requests.
     if workload=='code':
-        lines=[f'def sensor_{i}(raw, offset, gain):\\n    value = (raw - offset) * gain\\n    return max(-100.0, min(100.0, value))\\n' for i in range(max(40,n//22))]
-        text='\\n'.join(lines)+'\\n# Rewrite the sensor_0 function with a validity check, preserving the original calibration algorithm.\\ndef sensor_0_checked(raw, offset, gain):\\n'
+        lines=[f'def sensor_{i}(raw, offset, gain):\n    value = (raw - offset) * gain\n    return max(-100.0, min(100.0, value))\n' for i in range(max(40,n//22))]
+        text='\n'.join(lines)+'\n# Rewrite the sensor_0 function with a validity check, preserving the original calibration algorithm.\ndef sensor_0_checked(raw, offset, gain):\n'
     else:
         lines=[f'Test {i}: controller gain {i%17+1}, load {i*7%43}, measured residual {(i*i+17)%113}. Review measurement uncertainty and disturbances. ' for i in range(max(40,n//22))]
-        text=''.join(lines)+'\\nExplain how to distinguish noise from a systematic error, design an independent experiment, and justify the conclusion.\\nAnswer:'
+        text=''.join(lines)+'\nExplain how to distinguish noise from a systematic error, design an independent experiment, and justify the conclusion.\nAnswer:'
     tokens=api_json(port,'/tokenize',{'content':text,'add_special':False},auth,60).get('tokens',[])
     if not tokens or not all(type(x) is int for x in tokens):raise RuntimeError('tokenizer 응답 오류')
     prompt=tokens[-n:]
@@ -1420,8 +1421,9 @@ def speed_tune(raw):
                     samples[k]=speed_sample(trial['port'],k,n,m)
                 a=speed.assess(samples,baseline,target)
                 if i==0:baseline=samples
-                row={'label':label,**a,'samples':samples,'settings':{k:variant[k] for k in BASE['defaults'] if k in variant},'status':'ok'}
-                if a['match'] and (best is None or a['score']>best['score']):best=row
+                row={'label':label,**a,'samples':samples,'settings':{k:variant[k] for k in (*BASE['defaults'],'workspace','llama_dir','model_dir','server_exe','cuda_root') if k in variant},'status':'ok'}
+                if a['match'] and (best is None or (a['goal_pass'],a['score'])>(best['goal_pass'],best['score'])):best=row
+                row['settings']['server_exe']=str(exe)
                 rows.append(row)
                 log('tune',f'{label}: 코드 {a["rates"]["code"]:.2f}, 일반 {a["rates"]["general"]:.2f} t/s | 기준 출력 '+('일치' if a['match'] else '불일치 (추천 제외)'))
             except Exception as exc:
