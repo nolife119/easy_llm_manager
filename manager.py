@@ -423,7 +423,7 @@ def estimate(raw,hardware=None,weight_override=None):
     if d['expert_cache']:warnings.append('동적 Expert 캐시는 소규모 decode 배치에 유리하며 긴 prefill/동시 요청에서는 효과가 달라집니다.')
     if d['unified'] and d['pool']<d['context']*d['parallel']:warnings.append('공유 pool이 모든 슬롯 최대 길이의 합보다 작습니다. 동시 장문 요청은 제한/실패할 수 있습니다.')
     if d['kv_type']!='f16':warnings.append('양자화 KV 및 Flash Attention의 모델/빌드 호환성을 실행 시 검증해야 합니다.')
-    if d['host']=='0.0.0.0' and not d['auth']:danger.append('인증 없이 사내 네트워크에 노출합니다. 승인된 격리망에서만 사용하세요.')
+    if d['host']=='0.0.0.0' and not d['auth']:danger.append('사내망 접속에는 API 키가 필수입니다. 인증을 켜세요.')
     if d['ram_cache']:warnings.append('RAM prompt cache는 유휴/재사용 캐시입니다. 활성 KV 전체를 대체하지 않습니다. 다중 사용자 격리를 검증하세요.')
     if d['context']>=262144:warnings.append('긴 컨텍스트는 prefill 시간, 추가 상태 및 체크포인트 메모리를 크게 증가시킬 수 있습니다.')
     warnings.append('가중치 배치/Expert 비율 및 SWA는 추정치입니다. 프로젝트 파일, CUDA 버퍼, mmap, GPU별 레이어 불균형에 따라 실측이 달라집니다.')
@@ -561,7 +561,7 @@ def command_preview(raw):
         if not proj:raise ValueError('Vision projector 파일을 찾지 못했습니다. Vision 다운로드 옵션을 선택하세요.')
         args+=['--mmproj',str(proj)]
     else:args+=['--no-mmproj']
-    if d['host']=='0.0.0.0' and not d['auth']:args+=['--no-slots']
+    if d['host']=='0.0.0.0':args+=['--no-slots']
     if d['auth']:args+=['--api-key-file',str(KEYS)]
     opts=recovery_options(d)
     if opts:
@@ -837,6 +837,7 @@ def build(raw):
 
 def launch(raw):
     d,e,args=command_preview(raw)
+    if d['host']=='0.0.0.0' and not d['auth']:raise ValueError('사내망 접속은 API 키 인증이 필수입니다. 키를 등록하고 다시 시작하세요.')
     if task_busy('benchmark'):raise ValueError('벤치마크 작업이 끝난 뒤 서버를 시작하세요.')
     if e['danger'] and not raw.get('force'):return {'confirm':True,'danger':e['danger']}
     exe=find_server(d);f=resolve_model(d)
@@ -848,7 +849,7 @@ def launch(raw):
     arch=md.get('general.architecture')
     if arch and d['profile']=='inkling2' and arch!='inkling2':raise ValueError('선택한 파일이 Inkling 2 언어 모델이 아닙니다: '+str(arch))
     if '--mmproj' in args:files.append(str(Path(args[args.index('--mmproj')+1]).resolve()))
-    if d['auth'] and not read_keys():raise ValueError('API 키를 먼저 생성하세요.')
+    if d['auth'] and not read_keys():raise ValueError('API 키를 먼저 생성하세요. API 키 탭에서 생성한 다음 실행하세요.')
     if not e['gpu_ids']:raise ValueError('사용할 NVIDIA GPU가 없습니다.')
     with socket.socket() as s:
         try:s.bind((d['host'],d['port']))
@@ -858,7 +859,9 @@ def launch(raw):
     env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']));
     # Do not inherit unexpected API keys if the UI requests no authentication.
     for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
-    start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options','')})
+    with LOCK:
+        if d['auth'] and not read_keys():raise ValueError('등록된 API 키가 없습니다.')
+        start_task('server',lambda:step('server',args,cwd=exe.parent,env=env),{'port':d['port'],'auth':d['auth'],'alias':d['alias'],'host':d['host'],'context':d['context'],'parallel':d['parallel'],'profile':d['profile'],'quant':d['quant'],'cpu_layers':d['cpu_layers'],'expert_cache':d['expert_cache'],'cpu_share':d['cpu_share'],'kv_type':d['kv_type'],'kv_location':d['kv_location'],'files':files,'recovery_options':d.get('recovery_options',''),'engine':str(exe),'settings':{k:d[k] for k in BASE['defaults'] if k in d}})
     return {'started':True}
 
 
@@ -867,16 +870,56 @@ def read_keys():
     except OSError:return []
 
 
-def key_action(action,index=None):
-    if task_busy('server'):raise ValueError('키 변경 전 서버를 중지하세요. 변경 후 다시 시작해야 합니다.')
+def key_action(action,index=None,expected=None):
     with LOCK:
+        if task_busy('server') and TASKS['server'].get('meta',{}).get('auth'):
+            raise ValueError('인증 서버 실행 중에는 키 변경이 잠깁니다. 서버를 중지하고 키를 변경한 뒤 다시 시작하세요.')
         keys=read_keys(); new=None
         if action=='add':new=secrets.token_urlsafe(32);keys.append(new)
-        elif action=='remove':keys.pop(int(index))
+        elif action=='remove':
+            i=int(index)
+            if not 0<=i<len(keys) or expected!=keys[i][:6]+'…'+keys[i][-4:]:
+                raise ValueError('키 목록이 변경됐습니다. 새로고침 후 다시 시도하세요.')
+            keys.pop(i)
         else:raise ValueError('키 작업 오류')
-        KEYS.write_text('\n'.join(keys)+'\n',encoding='utf-8')
-        if not WIN:KEYS.chmod(0o600)
+        temp=KEYS.with_suffix('.tmp')
+        with os.fdopen(os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600),'w',encoding='utf-8') as f:
+            f.write('\n'.join(keys)+'\n')
+        if not WIN:temp.chmod(0o600)
+        temp.replace(KEYS)
     return {'new':new,'keys':masked_keys()}
+
+def local_addresses():
+    # No internet discovery; local adapter addresses only.
+    ips=set()
+    if WIN:
+        rc,out=run_capture(['ipconfig'],5)
+        if rc==0:
+            for line in out.splitlines():
+                if 'IPv4' in line:
+                    ips.update(re.findall(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])',line))
+    else:
+        try:ips.update(x[4][0] for x in socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET))
+        except OSError:pass
+    return sorted(x for x in ips if not x.startswith(('127.','169.254.','0.')))
+
+def probe_access():
+    with LOCK:
+        t=TASKS.get('server',{})
+        if not t.get('active'):raise ValueError('관리 중인 추론 서버를 먼저 실행하세요.')
+        m=dict(t.get('meta',{}))
+    port=m['port']; opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    def probe(path,key=None):
+        h={'Authorization':'Bearer '+key} if key else {}
+        try:
+            req=urllib.request.Request(f'http://127.0.0.1:{port}'+path,headers=h)
+            with opener.open(req,timeout=3) as response:return response.status
+        except urllib.error.HTTPError as exc:return exc.code
+        except (OSError,urllib.error.URLError):return None
+    keys=read_keys() if m.get('auth') else []
+    return {'health':probe('/health'),'without_key':probe('/v1/models'),
+            'with_key':probe('/v1/models',keys[0]) if keys else None,'auth':bool(m.get('auth'))}
+
 
 
 def masked_keys():return [{'index':i,'mask':x[:6]+'…'+x[-4:]} for i,x in enumerate(read_keys())]
@@ -1056,15 +1099,16 @@ def status():
     if t.get('active') and meta:
         health=local_api(meta['port'],'/health');
         if health:
-            metrics=local_api(meta['port'],'/metrics',meta['auth']);slots=local_api(meta['port'],'/slots',meta['auth'])
+            metrics=local_api(meta['port'],'/metrics',meta['auth'])
+            if meta.get('host')!='0.0.0.0':slots=local_api(meta['port'],'/slots',meta['auth'])
     rt,rf=ram()
     # slots can contain prompt internals depending on build; only report selected counters.
     slim=[]
     try:
         for s in json.loads(slots):
-            if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining') if k in s})
+            if isinstance(s,dict):slim.append({k:s[k] for k in ('id','is_processing','n_ctx','n_past','n_decoded','n_remaining','n_remain','n_prompt_tokens','n_prompt_tokens_processed','n_prompt_tokens_cached','n_cache_tokens') if k in s})
     except (ValueError,TypeError):pass
-    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else []}
+    return {'tasks':ts,'logs':logs,'gpu':gpus(),'ram_total':rt,'ram_free':rf,'health':health,'metrics':metrics,'slots':slim,'cache_stats':cache_stats(logs['server']),'history':history()[-10:],'server_errors':error_excerpt(logs['server']) if t.get('state')=='error' else [],'sample_time':time.time(),'key_count':len(read_keys())}
 
 
 def save_prefs(raw):
@@ -1076,14 +1120,14 @@ def save_prefs(raw):
     return {'ok':True}
 
 HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inkling Manager</title><style>
-:root{color-scheme:dark;--bg:#10151d;--panel:#19222e;--line:#344253;--fg:#edf2f7;--muted:#a5b5c7;--accent:#68d6b4;--warn:#f4be72}*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);font:14px/1.55 'Segoe UI',system-ui,sans-serif;margin:0}header{padding:22px max(24px,calc((100vw - 1260px)/2));background:#151e29;border-bottom:1px solid var(--line)}h1{margin:0;font-size:25px;letter-spacing:-.5px}h2{font-size:18px;margin:0 0 14px}h3{font-size:15px;margin:15px 0 8px}p{margin:8px 0;color:var(--muted)}main{max-width:1260px;margin:auto;padding:18px 24px 50px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}button,a.btn{border:1px solid var(--line);border-radius:7px;background:#253445;color:var(--fg);padding:9px 13px;font:inherit;cursor:pointer;text-decoration:none}button:hover{border-color:var(--accent)}button.active,button.primary{background:var(--accent);color:#0b211b;border-color:var(--accent);font-weight:650}button:disabled{opacity:.4;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:12px}.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}.panel{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:18px;margin-bottom:14px}.field{display:flex;flex-direction:column;gap:5px;margin:0 0 9px;min-width:0}.field>span{color:#c4d0df;font-size:13px}.field small{color:var(--muted)}input,select{width:100%;padding:9px 10px;background:#111923;color:var(--fg);border:1px solid var(--line);border-radius:6px;font:inherit;min-width:0}input[type=checkbox]{width:auto;margin-right:8px}label.check{display:flex;align-items:center;padding:8px 0}input:focus,select:focus{outline:1px solid var(--accent)}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.good{color:var(--accent)}.bad{color:#ff9992}.warn{color:var(--warn)}.muted{color:var(--muted)}.metric{background:#121b25;padding:13px;border-radius:8px;border:1px solid #2b3949}.metric b{display:block;font-size:23px;line-height:1.4;font-variant-numeric:tabular-nums}.bar{height:9px;background:#354254;border-radius:6px;overflow:hidden;margin:7px 0}.bar i{display:block;height:100%;background:var(--accent)}pre{background:#0c131c;border-radius:7px;padding:13px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:12px/1.55 Consolas,monospace;margin:8px 0}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left;overflow-wrap:anywhere}th{color:var(--muted)}a{color:#9cc9ff}.hidden{display:none!important}#toast{position:fixed;bottom:18px;right:18px;max-width:min(600px,95vw);background:#2c4252;border:1px solid #597a8d;border-radius:8px;padding:12px 16px;z-index:9;white-space:pre-wrap}#toast:empty{display:none}.lead{font-size:13px;color:var(--muted)}@media(max-width:850px){.cols{grid-template-columns:1fr}main{padding:12px}.panel{padding:13px}} </style></head><body>
-<header><h1>Easy LLM Manager v0.3 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
+:root{color-scheme:dark;--bg:#10151d;--panel:#19222e;--line:#344253;--fg:#edf2f7;--muted:#a5b5c7;--accent:#68d6b4;--warn:#f4be72}*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);font:14px/1.55 'Segoe UI',system-ui,sans-serif;margin:0}header{padding:22px max(24px,calc((100vw - 1260px)/2));background:#151e29;border-bottom:1px solid var(--line)}h1{margin:0;font-size:25px;letter-spacing:-.5px}h2{font-size:18px;margin:0 0 14px}h3{font-size:15px;margin:15px 0 8px}p{margin:8px 0;color:var(--muted)}main{max-width:1260px;margin:auto;padding:18px 24px 50px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}button,a.btn{border:1px solid var(--line);border-radius:7px;background:#253445;color:var(--fg);padding:9px 13px;font:inherit;cursor:pointer;text-decoration:none}button:hover{border-color:var(--accent)}button.active,button.primary{background:var(--accent);color:#0b211b;border-color:var(--accent);font-weight:650}button:disabled{opacity:.4;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:12px}.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}.panel{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:18px;margin-bottom:14px}.field{display:flex;flex-direction:column;gap:5px;margin:0 0 9px;min-width:0}.field>span{color:#c4d0df;font-size:13px}.field small{color:var(--muted)}input,select{width:100%;padding:9px 10px;background:#111923;color:var(--fg);border:1px solid var(--line);border-radius:6px;font:inherit;min-width:0}input[type=checkbox]{width:auto;margin-right:8px}label.check{display:flex;align-items:center;padding:8px 0}input:focus,select:focus{outline:1px solid var(--accent)}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.good{color:var(--accent)}.bad{color:#ff9992}.warn{color:var(--warn)}.muted{color:var(--muted)}.metric{background:#121b25;padding:13px;border-radius:8px;border:1px solid #2b3949}.metric b{display:block;font-size:23px;line-height:1.4;font-variant-numeric:tabular-nums}.bar{height:9px;background:#354254;border-radius:6px;overflow:hidden;margin:7px 0}.bar i{display:block;height:100%;background:var(--accent)}pre{background:#0c131c;border-radius:7px;padding:13px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;font:12px/1.55 Consolas,monospace;margin:8px 0}table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left;overflow-wrap:anywhere}th{color:var(--muted)}a{color:#9cc9ff}.hidden{display:none!important}#toast{position:fixed;bottom:18px;right:18px;max-width:min(600px,95vw);background:#2c4252;border:1px solid #597a8d;border-radius:8px;padding:12px 16px;z-index:9;white-space:pre-wrap}#toast:empty{display:none}.lead{font-size:13px;color:var(--muted)}@media(max-width:850px){.cols{grid-template-columns:1fr}main{padding:12px}.panel{padding:13px}} .studio{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(290px,.8fr);gap:16px;align-items:start}.stage{border-top:1px solid var(--line);padding:16px 0}.stage:first-of-type{border-top:0}.stage h3{margin:0 0 10px}.eyebrow{font-size:12px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em}.hero{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.hero h2{margin:0}.large-metric b{font-size:34px}.large-metric{min-height:102px}.dashgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.inline-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.inline-controls input,.inline-controls select{width:auto;max-width:100%}.inline-controls input[type=search]{flex:1;min-width:130px}.logview{height:440px;max-height:none;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.logview .errorline{color:#ffaaa5}.logview .warnline{color:#f4be72}.logview .timingline{color:#a6e7d3}.logview .line{display:block}.spark{width:100%;height:115px;display:block}.pillstatus{font-weight:650;border:1px solid var(--line);border-radius:999px;padding:5px 12px;white-space:nowrap}.mini-note{font-size:12px;color:var(--muted)}.sticky{position:sticky;top:12px}details>summary{cursor:pointer;font-weight:650;padding:10px 0}textarea{font:inherit} @media(max-width:900px){.studio{grid-template-columns:1fr}.sticky{position:static}} </style></head><body>
+<header><h1>Easy LLM Manager v0.4 <span class="lead"> / Windows local inference</span></h1><p>모델 다운로드부터 빌드, GPU 배치, API 서버 운영까지. 관리 화면은 이 PC의 localhost에서만 접근 가능.</p></header><main><nav id="nav"></nav><div class="grid" id="summary"></div>
 <section id="env" class="tab"><div class="cols"><div class="panel"><h2>환경 진단</h2><p>먼저 GPU와 필수 도구를 확인하세요. 설치 직후 PATH가 갱신되지 않았다면 이 도구를 다시 실행하세요.</p><div class="buttons"><button class="primary" onclick="diagnose()">환경 다시 검사</button><button onclick="act('install_hf',{})">HF 다운로드 도구 설치</button></div><div id="diagnosis"></div></div><div class="panel"><h2>저장 경로</h2><p>기존 AI 폴더 또는 여유 공간이 큰 고정 디스크를 탐색합니다. 필요하면 직접 수정하세요.</p><div id="pathFields"></div><div class="buttons"><button onclick="save()">경로/세팅 저장</button></div><p>모델, 빌드 결과는 작업 폴더에 저장합니다. 개인 설정과 API 키는 사용자 전용 데이터 폴더에 저장합니다.</p></div></div></section>
 <section id="download" class="tab hidden"><div class="cols"><div class="panel"><h2>모델 다운로드</h2><p>다운로드 선택은 서버 설정과 독립적입니다. 실행 중인 동일 파일은 보호됩니다.</p><div id="modelFields"></div><div id="modelSpec"></div><div class="buttons"><button onclick="act('inspect',downloadForm())">원격 파일/실제 용량 조회</button><button class="primary" onclick="downloadModel()">다운로드 / 이어받기</button><button onclick="stop('download')">중지</button></div><p>같은 repo·revision·폴더로 다시 실행하면 완료 파일 및 HF가 보존한 부분 캐시를 재사용합니다. 파일을 임의로 이동하지 마세요.</p></div><div class="panel"><h2>다운로드 로그</h2><pre id="downloadLog"></pre><p>서버 구동 전 첫 shard와 모든 분할 파일의 존재/헤더를 검사합니다.</p></div></div></section>
 <section id="build" class="tab hidden"><div class="cols"><div class="panel"><h2>llama.cpp 엔진 관리 · CUDA 빌드</h2><p>이미 체크아웃한 호환 브랜치가 있다면 아래 버튼을 사용하세요. 기존 소스를 업데이트하지 않습니다.</p><div class="buttons"><button onclick="scanEngines()">소스 및 실행 파일 검색</button><button class="primary" onclick="buildCurrent()">현재 체크아웃 그대로 빌드</button></div><div id="engineList"></div><details><summary>일반 빌드 / 공식 바이너리 설치</summary><p>기존 소스를 재사용하고 없다면 공식 Git 저장소에서 clone합니다. Visual Studio C++ 빌드 도구와 CUDA Toolkit이 필요합니다.</p><div id="buildFields"></div><h3>공식 사전 컴파일 바이너리 (컴파일 대안)</h3><div id="runtimeFields"></div><div class="buttons"><button onclick="installBinary()">공식 CUDA 바이너리 설치</button><button onclick="useInstalled()">설치/빌드 결과 실행 파일 적용</button></div><p>GitHub 공식 릴리스만 사용합니다. CUDA 12/13은 드라이버와 호환되는 버전을 선택하세요.</p><label class="check"><input type="checkbox" id="fresh_build">새 빌드 폴더 사용 (기존 파일 유지)</label><label class="check"><input type="checkbox" id="update_source">기존 소스 업데이트 (변경사항이 없을 때만)</label><div class="buttons"><button class="primary" onclick="act('build')">컴파일 시작</button><button onclick="stop('build')">중지</button></div><p>H100은 CUDA arch 90. Git ref를 지정하면 해당 버전으로 빌드합니다. 최초 빌드는 오래 걸릴 수 있습니다.</p></details></div><div class="panel"><h2>빌드 로그</h2><pre id="buildLog"></pre><p>오류 시 마지막 로그와 환경 진단을 확인하세요. 기존 CMake 생성기와 충돌한다면 소스를 보존하고 build 폴더만 이름을 변경한 후 다시 빌드하세요.</p></div></div></section>
-<section id="run" class="tab hidden"><div class="cols"><div class="panel"><h2>추론 서버 설정</h2><div id="runModel"></div><div id="wizard"></div><div class="buttons"><button onclick="inspectLocal()">로컬 GGUF 호환성 검사</button></div><pre id="localModelInspection">모델 파일을 변경하지 않는 검사입니다.</pre><details id="advancedDetails"><summary style="cursor:pointer;padding:12px 0;font-weight:650">고급 설정 · 모든 숫자 직접 변경</summary><div class="buttons"><button onclick="preset('safe')">첫 구동 (2 GPU)</button><button onclick="preset('long')">1M / GPU KV</button><button onclick="preset('host')">1M / RAM KV</button><button onclick="preset('team')">15인 공유 KV</button><button onclick="preset('q4long')">Q4 1M / 2 GPU</button></div><p>프리셋은 출발점일 뿐이며 GPU 장수와 선택 모델에 따라 조정하세요. 먼저 예상치를 계산하세요.</p><h3>모델 · 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진 · 네트워크</h3><div class="grid" id="advanced"></div><h3>오류 복구 옵션 (고급)</h3><p>실행 명령에 옵션을 추가/제거/변경합니다. 예: --flash-attn off 또는 --no-mmap. null은 제거, true는 스위치 추가입니다. 일반 설정에서 바꿀 수 있는 값은 그곳에서 변경하세요.</p><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--flash-attn":"off","--no-warmup":true,"--no-kv-unified":null}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="preset('rescue')">8K 안전 구동</button></div></details><div class="buttons"><button onclick="save()">세팅 저장</button><button onclick="preview()">예상 자원 / 명령어</button><button onclick="plan()">자동 메모리 배치 추천</button><button class="primary" onclick="startServer()">서버 시작</button><button onclick="stop('server')">서버 중지</button></div></div><div><div class="panel"><h2>실행 전 메모리 예측</h2><div id="estimate"><p>설정을 선택한 후 예상 자원을 계산하세요.</p></div><p>GiB 단위. 실제 llama.cpp가 할당하는 메모리는 다를 수 있습니다.</p><h3>자동 배치 후보</h3><div id="plans"><p>선택한 모델/컨텍스트를 유지한 채 후보를 계산합니다.</p></div><h3>생성 명령어</h3><pre id="command"></pre></div><div class="panel"><h2>접속</h2><div id="connection"></div><p>로컬 브라우저에서 먼저 테스트한 후 사내 IP를 사용하세요. Claude Code 확장은 Anthropic Messages API 호환 여부를 별도 확인하세요.</p></div></div></div></section>
-<section id="monitor" class="tab hidden"><div class="panel"><h2>실시간 GPU · 서버 상태</h2><div id="gpuCards" class="grid"></div><div id="taskCards" class="grid"></div><div class="buttons"><button onclick="stop('server')">관리 중인 서버 중지</button><button onclick="poll()">즉시 갱신</button></div><div id="health"></div></div><div class="cols"><div class="panel"><h2>서버 로그 (최근 900줄)</h2><h3>최근 실행 요청 오류</h3><pre id="actionError">—</pre><h3>실패 로그 핵심 (자동 추출)</h3><pre id="serverErrors">—</pre><h3>로컬 진단 명령</h3><p>서버 외부로 전송하지 않습니다. 허용된 진단 명령만 실행합니다.</p><input id="diagCommand" list="diagList" value="llama-server --version"><datalist id="diagList"><option value="llama-server --version"><option value="llama-server --help"><option value="llama-server --list-devices"><option value="nvidia-smi"><option value="nvidia-smi -q"><option value="nvcc --version"></datalist><div class="buttons"><button onclick="runDiagnostic()">진단 실행</button></div><pre id="diagOutput"></pre><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><pre id="serverLog" style="max-height:560px"></pre></div><div class="panel"><h2>API /metrics · /slots</h2><div id="rates" class="grid"></div><pre id="metrics"></pre><pre id="slots"></pre></div></div></section>
-<section id="tuning" class="tab hidden"><div class="panel"><h2>실측 벤치마크 · 자동 튜닝</h2><p>합성 토큰만 사용합니다. 단일 슬롯에서 테스트하세요. 자동 튜닝은 서버를 중지한 상태에서 여러 후보를 직접 로딩하고 실패 시 다음 후보로 이동합니다. 1M 설정은 매우 오래 걸릴 수 있습니다. 입력 길이를 짧게 시작하세요.</p><div class="grid"><label class="field"><span>입력 토큰 수</span><input type="number" id="bench_prompt" value="512" min="32" max="1048576"></label><label class="field"><span>생성 토큰 수</span><input type="number" id="bench_output" value="128" min="16" max="1024"></label></div><div class="buttons"><button onclick="runBench(false)">실행 중 서버 벤치마크</button><button class="primary" onclick="runBench(true)">자동 튜닝 (서버 중지 후)</button><button onclick="stop('tune')">튜닝 중지</button><button onclick="applyBest()">가장 빠른 실측 후보 적용</button></div><div id="tuneBest"></div><h3>최근 측정 (최대 10개)</h3><div id="history"></div><h3>벤치마크 로그</h3><pre id="benchmarkLog"></pre><h3>튜닝 로그</h3><pre id="tuneLog"></pre></div></section><section id="auth" class="tab hidden"><div class="panel"><h2>API 접근 키</h2><p>기본값은 인증 없음 + localhost. 사내 네트워크에서 서비스할 때만 승인된 범위에 노출하고 API 키 사용을 권장합니다. 키 활성화는 실행 설정에서 별도로 선택하세요. 키 추가/회수 후 재시작이 필요합니다.</p><div class="buttons"><button class="primary" onclick="key('add')">새 API 키 생성</button></div><div id="newKey"></div><div id="keyList"></div><p>키는 사용자 전용 디렉터리의 api-keys.txt에 저장되며 Git에 포함되지 않습니다. 사용자별 요청량 할당/회계는 제공하지 않습니다.</p></div></section></main><div id="toast" role="status"></div>
+<section id="run" class="tab hidden"><div class="hero"><div><h2>서버 실행</h2><p>모델 → 접속 → 사용 목적. 나머지는 자동 추천하거나 기존 세팅을 그대로 사용합니다.</p></div><span id="runLive" class="pillstatus">상태 확인 중</span></div><div class="studio"><div class="panel"><div class="stage"><div class="eyebrow">01 · 모델</div><h3>어떤 모델을 실행할까요?</h3><div id="runModel"></div><div id="engineLabel" class="mini-note"></div><details><summary>모델 호환성 검사</summary><button onclick="inspectLocal()">GGUF 확인</button><pre id="localModelInspection">파일을 변경하지 않습니다.</pre></details></div><div class="stage"><div class="eyebrow">02 · 접속 및 인증</div><h3>누가 사용할까요?</h3><div id="networkFields"></div><div id="networkNotice"></div><div class="buttons"><button onclick="tab('auth')">API 키 관리 / 발급</button><button onclick="refreshAddresses()">서버 IP 확인</button></div><div id="addressList" class="mini-note"></div></div><div class="stage"><div class="eyebrow">03 · 사용 목적</div><div id="wizard"></div></div><details id="advancedDetails"><summary>고급 설정 · 숫자 직접 조정 및 복구</summary><div class="buttons"><button onclick="preset('rescue')">8K 복구</button><button onclick="preset('team')">공유 KV 15인</button></div><h3>메모리 배치</h3><div class="grid" id="placement"></div><h3>컨텍스트 · 캐시</h3><div class="grid" id="contexts"></div><h3>엔진</h3><div class="grid" id="advanced"></div><h3>오류 복구 JSON</h3><textarea id="recovery" rows="4" style="width:100%;background:#111923;color:inherit;padding:9px" placeholder='{"--no-mmap":true}'></textarea><div class="buttons"><button onclick="clearRecovery()">복구 옵션 초기화</button><button onclick="plan()">추가 배치 후보</button></div><div id="plans"></div></details></div><div class="sticky"><div class="panel"><h2>실행 준비</h2><div id="setupSummary"></div><div class="buttons"><button class="primary" id="smartStart" onclick="wizardStart()">추천값으로 시작</button><button id="exactStart" onclick="startServer()">현재 설정 그대로 시작</button><button onclick="save()">설정 저장</button><button onclick="stop('server')">서버 중지</button></div><p class="mini-note">추천은 CPU 분산 등 숫자를 다시 계산합니다. 이미 정상 구동한 설정은 '현재 설정 그대로 시작'을 사용하세요.</p><button onclick="restoreActive()">최근 실행 설정 복원</button><button onclick="preview()">메모리 미리보기</button><div id="estimate"><p>실행 전 예상치를 확인합니다.</p></div><details><summary>실제 실행 명령</summary><pre id="command"></pre></details></div><div class="panel"><h2>접속 주소</h2><div id="connection"></div><p>관리 화면은 항상 localhost 전용입니다. 사내망 방화벽은 승인된 범위에서 별도 설정하세요.</p></div></div></div></section>
+<section id="monitor" class="tab hidden"><div class="panel hero"><div><div class="eyebrow">LIVE · INFERENCE</div><h2 id="monitorState">추론 서버</h2><p id="monitorMeta">아직 실행하지 않았습니다.</p><div id="health" class="mini-note"></div></div><div class="buttons"><button onclick="tab('run')">실행 설정</button><button onclick="poll()">갱신</button><button onclick="stop('server')">서버 중지</button></div></div><div class="dashgrid" id="throughput"></div><div class="panel" style="margin-top:14px"><h2>최근 처리량 · 최근 2분 내 최대 40개 표본</h2><div class="cols"><div><p>입력 처리 / Prefill (tokens/s)</p><div id="promptTrend"></div></div><div><p>출력 생성 / Decode (tokens/s)</p><div id="decodeTrend"></div></div></div><p class="mini-note" id="metricSource">실측 엔진 카운터 또는 완료된 요청 로그를 표시합니다. 표본이 없으면 —.</p></div><div class="cols"><div class="panel"><h2>요청 · 컨텍스트 · 캐시</h2><div id="rates" class="dashgrid"></div><div id="slotDisplay"></div><p class="mini-note">입력 처리 토큰은 캐시 재사용 전 전체 프롬프트 길이와 다를 수 있습니다. KV 점유율과 Expert 적중률은 각각 다른 지표입니다.</p></div><div class="panel"><h2>하드웨어</h2><div id="gpuCards" class="grid"></div><div id="ramCard"></div><details><summary>다른 작업 상태</summary><div id="taskCards" class="grid"></div></details></div></div><div class="panel"><div class="hero"><h2>서버 로그</h2><span id="logCount" class="mini-note"></span></div><div id="errorBanner"></div><div class="inline-controls"><input id="logSearch" type="search" placeholder="로그 검색" oninput="renderServerLog()"><select id="logFilter" onchange="renderServerLog()"><option value="all">모든 로그</option><option value="errors">오류 / 경고</option><option value="timing">토큰 / 캐시 / 타이밍</option><option value="loading">모델 로딩</option></select><label class="check"><input type="checkbox" id="follow" checked>자동 스크롤</label><button onclick="copyServerLog()">표시 로그 복사</button></div><div id="serverLog" class="logview" style="background:#0c131c;border-radius:7px;padding:12px;font:12px/1.65 Consolas,monospace"></div><details><summary>최근 실행 요청 오류 / 자동 진단</summary><pre id="actionError">—</pre><pre id="serverErrors">—</pre><input id="diagCommand" list="diagList" value="llama-server --version"><datalist id="diagList"><option value="llama-server --version"><option value="llama-server --help"><option value="llama-server --list-devices"><option value="nvidia-smi"><option value="nvidia-smi -q"><option value="nvcc --version"></datalist><div class="buttons"><button onclick="runDiagnostic()">진단 실행</button></div><pre id="diagOutput"></pre></details><details><summary>원시 /metrics · 익명화된 /slots</summary><pre id="metrics"></pre><pre id="slots"></pre></details></div></section>
+<section id="tuning" class="tab hidden"><div class="panel"><h2>실측 벤치마크 · 자동 튜닝</h2><p>합성 토큰만 사용합니다. 단일 슬롯에서 테스트하세요. 자동 튜닝은 서버를 중지한 상태에서 여러 후보를 직접 로딩하고 실패 시 다음 후보로 이동합니다. 1M 설정은 매우 오래 걸릴 수 있습니다. 입력 길이를 짧게 시작하세요.</p><div class="grid"><label class="field"><span>입력 토큰 수</span><input type="number" id="bench_prompt" value="512" min="32" max="1048576"></label><label class="field"><span>생성 토큰 수</span><input type="number" id="bench_output" value="128" min="16" max="1024"></label></div><div class="buttons"><button onclick="runBench(false)">실행 중 서버 벤치마크</button><button class="primary" onclick="runBench(true)">자동 튜닝 (서버 중지 후)</button><button onclick="stop('tune')">튜닝 중지</button><button onclick="applyBest()">가장 빠른 실측 후보 적용</button></div><div id="tuneBest"></div><h3>최근 측정 (최대 10개)</h3><div id="history"></div><h3>벤치마크 로그</h3><pre id="benchmarkLog"></pre><h3>튜닝 로그</h3><pre id="tuneLog"></pre></div></section><section id="auth" class="tab hidden"><div class="studio"><div class="panel"><div class="eyebrow">ACCESS CONTROL</div><h2>API 키 관리</h2><div id="authState"></div><p>서버에 접속하는 사람마다 키를 하나씩 발급하세요. 키 원문은 생성할 때만 표시하며 기존 키는 가립니다.</p><div class="buttons"><button class="primary" id="addKey" onclick="key('add')">새 API 키 발급</button><button onclick="keys()">목록 새로고침</button></div><div id="newKey"></div><div id="keyList"></div><p class="mini-note">인증이 켜진 서버는 중지 후 발급·회수해야 합니다. 로컬 미인증 서버에서는 미리 발급 가능합니다. 저장된 키는 다음 인증 시작 시 적용됩니다.</p></div><div class="panel"><h2>연결 &amp; 인증 테스트</h2><div id="authConnection"></div><button onclick="testAccess()">현재 서버 API 테스트</button><pre id="accessTest">실행 후 테스트하면 API 응답 코드를 확인합니다.</pre><p>공유 서버에는 API 키가 필수입니다. HTTP는 암호화되지 않으므로 승인된 네트워크/TLS 프록시가 필요합니다. 사용자별 토큰 회계나 권한 격리는 지원하지 않습니다.</p><button onclick="tab('run')">서버 실행 설정으로</button></div></div></section></main><div id="toast" role="status"></div>
 <script>
 const csrf=__TOKEN__; let config, form={}, prev=null, polling=false, current='env', plans=[], dl={}; const $=x=>document.getElementById(x); const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); const fmt=x=>x==null?'—':Number(x).toFixed(1); let toastTimer;
 function toast(x){$('toast').textContent=x;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').textContent='',10000)}
@@ -1172,7 +1216,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/config':
                 w,l,m,x=paths();form={**BASE['defaults'],'workspace':str(w),'llama_dir':BASE['llama_dir'],'model_dir':BASE['model_dir'],'server_exe':BASE['server_exe'],'build_jobs':BASE['build_jobs'],'cuda_arch':BASE['cuda_arch'],'llama_ref':BASE['llama_ref'],'cuda_root':BASE.get('cuda_root',''),'runtime_cuda':BASE.get('runtime_cuda','12'),'runtime_tag':BASE.get('runtime_tag',''),**SETTINGS};return self.send(200,{'form':form,'model_profiles':BASE['model_profiles']})
             if self.path=='/api/status':return self.send(200,status())
-            if self.path=='/api/keys':return self.send(200,{'keys':masked_keys()})
+            if self.path=='/api/keys':return self.send(200,{'keys':masked_keys(),'locked':bool(task_busy('server') and TASKS['server'].get('meta',{}).get('auth'))})
+            if self.path=='/api/addresses':return self.send(200,{'addresses':local_addresses()})
             return self.send(404,{'error':'not found'})
         except (BrokenPipeError,ConnectionResetError):pass
         except Exception as e:self.send(500,{'error':str(e)})
@@ -1204,7 +1249,8 @@ class Handler(BaseHTTPRequestHandler):
             elif action=='stop':
                 if raw.get('kind') not in ('download','server','build','tune'):raise ValueError('invalid task')
                 stop_task(raw['kind'])
-            elif action=='key':result=key_action(raw['action'],raw.get('index'))
+            elif action=='key':result=key_action(raw['action'],raw.get('index'),raw.get('expected'))
+            elif action=='probe_access':result=probe_access()
             else:return self.send(404,{'error':'not found'})
             self.send(200,result)
         except (BrokenPipeError,ConnectionResetError):pass
