@@ -146,3 +146,10 @@ code .
 - 모니터링 탭에 최근 실행 요청 오류 및 실패 로그 핵심 줄을 표시합니다. `llama-server --version`, `llama-server --help`, `llama-server --list-devices`, `nvidia-smi`, `nvidia-smi -q`, `nvcc --version`을 진단 명령에 입력해 로컬 출력으로 확인합니다. 별도의 임의 PowerShell 명령은 승인된 터미널에서 직접 실행하세요. 로그를 외부로 보내는 기능은 없습니다.
 - 오류 원인을 확인할 때 마지막 `failed to load model`보다 그 앞의 구체적 오류(예: unknown architecture, allocation failure, assertion)를 우선 확인하세요.
 - Python/JavaScript 구문 확인과 모의 동시 작업 및 복구 옵션 검증을 수행했습니다. 실제 Windows H100 로딩은 검증되지 않았으며 기존 모델 파일의 다운로드 무결성과 엔진 호환성은 별도 확인해야 합니다.
+
+
+## v0.2.2 간편 실행
+
+서버 실행 탭에서 모델, 사용 목적, 슬롯당 컨텍스트, KV 위치, 가중치 배치 방식을 선택하고 추천값 적용 또는 추천값으로 실행을 누릅니다. GPU/RAM 여유를 기준으로 CPU MoE 층, 캐시, 런타임 여유 공간, 배치와 스레드를 추천합니다. 요청 컨텍스트를 자동으로 낮추지 않으며 실제 속도/메모리 성공은 실측이 필요합니다. 팀 설정은 슬롯별 독립 컨텍스트로 계산합니다. 동적 Expert 캐시는 실험 옵션이며 지원 빌드가 필요합니다. 복구 옵션과 기존 인증/네트워크 설정은 유지됩니다. 고급 설정에서 모든 숫자를 수정할 수 있습니다.
+
+텍스트 전용 모드는 명시적으로 `--no-mmproj`를 전달하고 상속된 projector 관련 환경변수를 제거합니다. `unknown projector type: inkling2` 오류는 언어 모델의 `inkling2`와 upstream vision projector의 `inkling2v` 형식 차이로 발생할 수 있습니다. Vision 체크 해제, 첫 GGUF shard 경로 확인, 필요하면 별도의 projector 파일만 호환 버전으로 교체하세요. 복구 JSON에서 `{"--mmproj":null,"--no-mmproj":true}`도 사용할 수 있습니다. Windows H100 실측은 아직 수행하지 않았습니다.
