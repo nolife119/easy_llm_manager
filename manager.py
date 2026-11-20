@@ -379,6 +379,7 @@ def validate(d):
     if d['mode'] not in ('gpu','hybrid') or d['kv_location'] not in ('gpu','cpu') or d['kv_type'] not in ('f16','q8_0','q4_0'):raise ValueError('지원하지 않는 모드입니다.')
     if d['host'] not in ('127.0.0.1','0.0.0.0'):raise ValueError('지원하는 호스트: 127.0.0.1 / 0.0.0.0')
     if d['reasoning'] not in ('none','minimal','low','medium','high','xhigh','max'):raise ValueError('reasoning 설정 오류')
+    if d.get('gpu_fast') and (d['mode']!='gpu' or d['kv_location']!='gpu' or d['parallel']!=1 or d['unified'] or d['ram_cache']):raise ValueError('GPU 최대 모드는 가중치/KV GPU, 단일 슬롯, RAM prompt cache 0 전용입니다.')
     if d.get('load_mode','auto') not in ('auto','mmap','none'):raise ValueError('모델 로딩 방식 오류')
     if d['mode']=='gpu':d['cpu_layers']=0;d['expert_cache']=0;d['cpu_share']=0
     if d['cpu_layers']==0 and d['expert_cache']:raise ValueError('Expert 캐시는 CPU Expert가 있어야 합니다.')
@@ -508,9 +509,9 @@ def apply_recovery(args,opts):
             if v is not True:args.append(v)
     return args
 
-SMART_KEYS=('profile','quant','model_path','context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split','load_mode')
+SMART_KEYS=('profile','quant','model_path','context','parallel','unified','pool','mode','cpu_layers','expert_cache','cpu_share','expert_verbose','kv_location','kv_type','runtime_reserve','ram_reserve','ram_cache','batch','ubatch','threads','vision','gpu_ids','split','load_mode','gpu_fast')
 def smart_settings(d):
-    return {k:d[k] for k in SMART_KEYS}
+    return {k:d.get(k,BASE['defaults'].get(k)) for k in SMART_KEYS}
 
 def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
     """Bounded deterministic search; fixed model/context/slots/vision/KV placement."""
@@ -578,13 +579,51 @@ def smart_search(base,p,weight,hardware,strategy,precision,policy,caps):
         if f16:out.append(f16)
     return out,(nearest[1] if nearest else None),tested
 
+def gpu_context_search(base,p,weight,hardware,precision,policy,caps):
+    """Max context is an explicit objective, not a silent relaxation of fixed requests."""
+    limit=p['max_context']
+    ladder=sorted({limit,*[x*1024 for x in (4,8,16,24,32,48,64,96,128,160,192,224,256,320,384,448,512,640,768,896,1024) if x*1024<=limit]},reverse=True)
+    kinds=[precision] if precision!='auto' else ['f16','q8_0','q4_0']
+    kinds=[k for k in kinds if k=='f16' or caps['quant_kv']]
+    levels=[];nearest=None;count=0
+    for ctx in ladder:
+        fixed={**base,'purpose':'coding','context':ctx,'pool':ctx,'parallel':1,'unified':False,'mode':'gpu',
+               'cpu_layers':0,'expert_cache':0,'cpu_share':0,'kv_location':'gpu','ram_cache':0,'gpu_fast':True}
+        for k in kinds:
+            candidates,near,n=smart_search(fixed,p,weight,hardware,'gpu',k,policy,caps);count+=n
+            if near and (nearest is None or near['deficit']<nearest['deficit']):nearest=near
+            if candidates:
+                # The best modeled configuration at each length/precision, plus a small-batch fallback.
+                levels.append(candidates[0])
+                smaller=min(candidates,key=lambda x:(x['settings']['ubatch'],x['settings']['batch'],x['rank']))
+                if smaller!=candidates[0]:levels.append(smaller)
+    if not levels:return [],nearest,count
+    korder={'f16':0,'q8_0':1,'q4_0':2}
+    def rank(x):
+        d=x['settings']
+        return (-d['context'],int(x['swa_risk']),korder[d['kv_type']],x['rank'])
+    levels.sort(key=rank)
+    # Default to the greatest modeled length; separately expose conservative and F16 alternatives.
+    top=levels[0];out=[top]
+    def add(x):
+        if x is not None and x not in out:out.append(x)
+    add(next((x for x in levels if not x['swa_risk']),None))
+    for k in kinds:
+        add(next((x for x in levels if x['settings']['kv_type']==k),None))
+    for fraction in (.75,.5,.25):
+        add(next((x for x in levels if x['settings']['context']<=top['settings']['context']*fraction and x['settings']['kv_type']==top['settings']['kv_type']),None))
+    add(next((x for x in levels if x['settings']['kv_type']=='f16' and x['settings']['context']<=32768),None))
+    add(next((x for x in levels if x['settings']['context']==top['settings']['context'] and x['settings']['ubatch']<top['settings']['ubatch']),None))
+    out.sort(key=rank)
+    return out,top,count
+
 def recommend_setup(raw):
     """Search current free hardware; no automatic model download, launch or constraint relaxation."""
     p,q=profile(raw)
     purpose=raw.get('wizard_purpose','coding');location=raw.get('wizard_kv','gpu');strategy=raw.get('wizard_strategy','auto')
     precision=raw.get('wizard_precision','auto');policy=raw.get('wizard_policy','balanced')
     quant_mode=raw.get('wizard_quant_mode','fixed');target=num({'v':raw.get('wizard_target',10)},'v',1,1000,False)
-    if purpose not in ('safe','coding','long','team') or location not in ('gpu','cpu') or strategy not in ('auto','gpu','static','dynamic') or precision not in ('auto','f16','q8_0','q4_0') or policy not in ('balanced','safe') or quant_mode not in ('fixed','quality','all'):
+    if purpose not in ('safe','coding','long','team','gpu_max') or location not in ('gpu','cpu') or strategy not in ('auto','gpu','static','dynamic') or precision not in ('auto','f16','q8_0','q4_0') or policy not in ('balanced','safe') or quant_mode not in ('fixed','quality','all'):
         raise ValueError('간편 설정 선택을 확인하세요.')
     if any(task_busy(k) for k in ('server','tune','benchmark','build')):raise ValueError('실행/튜닝/빌드 중인 작업을 중지하고 메모리가 반환된 뒤 계산하세요.')
     opts=recovery_options(raw)
@@ -592,12 +631,15 @@ def recommend_setup(raw):
     if conflicts:raise ValueError('자동 최적화와 충돌하는 복구 옵션: '+', '.join(sorted(conflicts))+'. 복구 옵션을 초기화하거나 직접 실행하세요.')
     gs=gpus();rt,rf=ram();hardware=(gs,rt,rf)
     if not gs or rf is None:return {'ok':False,'message':'GPU/RAM 자동 감지 실패. 환경 진단을 확인하세요.'}
-    desired=num({'v':raw.get('wizard_context',32768)},'v',512,p['max_context'])
+    maximize=purpose=='gpu_max'
+    if maximize:
+        location='gpu';strategy='gpu';quant_mode='fixed'
+    desired=p['max_context'] if maximize else num({'v':raw.get('wizard_context',32768)},'v',512,p['max_context'])
     slots=num({'v':raw.get('wizard_slots',4)},'v',1,128) if purpose=='team' else 1
     d={**BASE['defaults'],**raw,'purpose':purpose,'context':desired,'parallel':slots,'unified':False,'pool':desired*slots,
        'mode':'gpu','cpu_layers':0,'expert_cache':0,'cpu_share':0,'expert_verbose':False,'kv_location':location,
        'kv_type':'f16','ram_cache':0,'runtime_reserve':8,'ram_reserve':8,'batch':256,'ubatch':128,
-       'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False)),'load_mode':raw.get('load_mode','auto')}
+       'threads':max(1,(os.cpu_count() or 2)//2),'vision':bool(raw.get('vision',False)),'load_mode':raw.get('load_mode','auto'),'gpu_fast':maximize}
     # Keep explicitly selected GPUs and split; do not silently switch devices.
     selected=selected_gpus(d,gs)
     if not selected or any(g['free']<=0 for g in selected):return {'ok':False,'message':'선택 GPU에 여유 VRAM이 없습니다.'}
@@ -627,8 +669,10 @@ def recommend_setup(raw):
         if trial['vision']:
             paths_to_check=([repo_path(trial)/projector,f.parent/projector,f.parent.parent/projector] if f and projector else [repo_path(trial)/projector] if projector else [])
             if not any(x.is_file() for x in paths_to_check):installed=False;issue='Vision projector가 없습니다.'
-        candidates,near,count=smart_search(trial,p,weight,hardware,strategy,precision,policy,caps);tested+=count
-        if WIN and caps['direct_load'] and trial['load_mode']=='auto' and weight<rf and not any(k in opts for k in ('--mmap','--no-mmap')):
+        if maximize:candidates,near,count=gpu_context_search(trial,p,weight,hardware,precision,policy,caps)
+        else:candidates,near,count=smart_search(trial,p,weight,hardware,strategy,precision,policy,caps)
+        tested+=count
+        if not maximize and WIN and caps['direct_load'] and trial['load_mode']=='auto' and weight<rf and not any(k in opts for k in ('--mmap','--no-mmap')):
             direct,near_direct,n_direct=smart_search({**trial,'load_mode':'none'},p,weight,hardware,strategy,precision,policy,caps);tested+=n_direct
             # Keep both loading modes. Direct reading may lower resident file pages, but peak RAM is unverified.
             if direct:candidates=sorted(candidates[:4]+direct[:4],key=lambda x:x['rank'])
@@ -644,9 +688,11 @@ def recommend_setup(raw):
             if chosen is None:chosen=candidates[0];fallbacks=candidates[1:]
             else:fallbacks.append(candidates[0])
     result={'ok':bool(chosen),'tested':tested,'models':summaries,'target_tps':target,'downloadable':downloadable[:4],
-            'candidate':chosen or nearest,'alternatives':fallbacks,'hardware':{'gpus':selected,'ram_total':rt,'ram_free':rf},
+            'candidate':chosen or nearest,'alternatives':fallbacks,'maximize_context':maximize,'hardware':{'gpus':selected,'ram_total':rt,'ram_free':rf},
             'message':'추정상 가능한 설정을 찾았습니다. 속도와 실제 초기화는 벤치마크 전까지 미검증입니다.' if chosen else '고정한 조건으로 설치된 모델의 실행 가능 후보를 찾지 못했습니다. 아래 부족량과 다운로드 후보를 확인하세요.'}
-    if chosen:result['settings']=chosen['settings']
+    if chosen:
+        result['settings']=chosen['settings']
+        if maximize:result['message']='GPU 전용 최대 컨텍스트 추정 후보입니다. 실제 최대 길이/속도는 순차 로딩과 벤치마크로 검증하세요.'
     return result
 
 
@@ -681,6 +727,12 @@ def command_preview(raw):
     if exe and exe.is_file():
         env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
         h=engine_help(str(exe),env)
+        if d.get('gpu_fast'):
+            if help_has(h,'--kv-offload'):args+=['--kv-offload']
+            for flag in ('--ctx-checkpoints','--swa-checkpoints'):
+                if help_has(h,flag):args+=[flag,'0'];break
+            # Checkpoints are disabled to reduce additional state; active KV remains in VRAM.
+            if help_has(h,'--no-cache-idle-slots'):args+=['--no-cache-idle-slots']
         mode=d.get('load_mode','auto')
         if mode!='auto':
             if any(k in opts for k in ('--mmap','--no-mmap')):raise ValueError('모델 로딩 방식과 복구 mmap 옵션을 동시에 지정하지 마세요.')
@@ -951,6 +1003,12 @@ def build(raw):
     start_task('build',job)
 
 
+def clean_inference_env(env):
+    # This manager owns inference flags. Preserve CUDA/driver/PATH, not inherited llama flags.
+    for k in list(env):
+        if k.upper().startswith('LLAMA_ARG_') or k.upper()=='LLAMA_API_KEY':env.pop(k,None)
+    return env
+
 def launch(raw):
     d,e,args=command_preview(raw)
     if d['host']=='0.0.0.0' and not d['auth']:raise ValueError('사내망 접속은 API 키 인증이 필수입니다. 키를 등록하고 다시 시작하세요.')
@@ -970,7 +1028,7 @@ def launch(raw):
     with socket.socket() as s:
         try:s.bind((d['host'],d['port']))
         except OSError:raise ValueError('서버 포트가 이미 사용 중이거나 열 수 없습니다.')
-    env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
+    env=clean_inference_env(cuda_env(d));env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','')
     supports(str(exe),args,env)
     env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']));
     # Do not inherit unexpected API keys if the UI requests no authentication.
@@ -1161,9 +1219,18 @@ def tune(raw):
         for c in choices:
             k=c['settings']['quant']
             if k not in seen:distinct.append(c);seen.add(k)
-        ordered=distinct+[c for c in choices if c not in distinct]
-        variants=[dict(c['settings']) for c in ordered[:limit]]
-        variants.sort(key=lambda x:BASE['model_profiles'][x['profile']]['quants'][x['quant']]['gb'],reverse=True)
+        if plan.get('maximize_context'):
+            # Reserve trials for lower-context and F16 fallback instead of repeated near-identical variants.
+            ordered=choices[:max(1,limit-2)]
+            f16=next((c for c in reversed(choices) if c['settings']['kv_type']=='f16' and c not in ordered),None)
+            lower=next((c for c in reversed(choices) if c not in ordered and c!=f16),None)
+            ordered += [c for c in (lower,f16) if c is not None]
+            variants=[dict(c['settings']) for c in ordered[:limit]]
+            variants.sort(key=lambda x:x['context'],reverse=True)
+        else:
+            ordered=distinct+[c for c in choices if c not in distinct]
+            variants=[dict(c['settings']) for c in ordered[:limit]]
+            variants.sort(key=lambda x:BASE['model_profiles'][x['profile']]['quants'][x['quant']]['gb'],reverse=True)
     else:
         n,m=bench_counts(raw,d['context'])
         plan=placement_plan(d);choices=plan['candidates']
@@ -1179,11 +1246,11 @@ def tune(raw):
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));trial['port']=sock.getsockname()[1]
             try:_,e,args=command_preview(trial)
             except (ValueError,OSError) as exc:log('tune','후보 설정 실패: '+str(exc));continue
-            label=f"{i+1}/{len(variants)}: {trial['quant']} / {trial['kv_type']} / {trial.get('load_mode','auto')} / CPU {trial['cpu_layers']}층, cache {trial['expert_cache']} MiB, CPU share {trial['cpu_share']}"
+            label=f"{i+1}/{len(variants)}: {trial['quant']} / ctx {trial['context']} / {trial['kv_type']} / {trial.get('load_mode','auto')} / CPU {trial['cpu_layers']}층, cache {trial['expert_cache']} MiB, CPU share {trial['cpu_share']}"
             log('tune',label)
             if e['danger']:
                 log('tune','메모리 재검사 실패, 후보 건너뜀: '+'; '.join(e['danger']));continue
-            env=cuda_env(d);env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','');env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']))
+            env=clean_inference_env(cuda_env(d));env['PATH']=str(exe.parent)+os.pathsep+env.get('PATH','');env['CUDA_VISIBLE_DEVICES']=','.join(map(str,e['gpu_ids']))
             for k in ('LLAMA_API_KEY','LLAMA_ARG_API_KEY','LLAMA_ARG_API_KEY_FILE','LLAMA_ARG_MMPROJ','LLAMA_ARG_MMPROJ_URL','LLAMA_ARG_MMPROJ_AUTO'):env.pop(k,None)
             try:supports(str(exe),args,env)
             except ValueError as exc:log('tune',str(exc));continue
@@ -1203,9 +1270,10 @@ def tune(raw):
                         if api_json(trial['port'],'/health').get('status')=='ok':break
                     except (OSError,ValueError):pass
                     time.sleep(2)
-                first=measure_server(trial['port'],n,m)
+                trial_n=min(n,trial['context']-m-32)
+                first=measure_server(trial['port'],trial_n,m)
                 if TASKS['tune']['cancel']:break
-                second=measure_server(trial['port'],n,m,seed=124)
+                second=measure_server(trial['port'],trial_n,m,seed=124)
                 packed={**second,'cold_decode_tps':first['predicted_per_second']}
                 item=record_bench('tune',trial,packed);results.append(item)
                 if goal:
