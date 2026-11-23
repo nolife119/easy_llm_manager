@@ -5,6 +5,7 @@ multi-GPU model parallelism. Never claims that configured 1M == tested 1M.
 """
 from __future__ import annotations
 import argparse
+import sys
 from datetime import datetime, timezone
 import json
 import os
@@ -20,6 +21,9 @@ import urllib.request
 import uuid
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+if __name__ == "__main__":
+    sys.modules.setdefault("experiment_lab", sys.modules[__name__])
 
 ROOT = Path(__file__).resolve().parent
 STATE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "InklingManager" / "experiment-platform"
