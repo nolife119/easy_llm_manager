@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import mini_runtime as rt
+import mini_firewall as fw
 
 PORT = 8766
 ROOT = Path(__file__).resolve().parent
@@ -182,6 +183,9 @@ class Manager:
             raise ValueError("선택한 GPU 인덱스가 없습니다")
         caps = rt.probe_engine(cfg["engine"])
         cmd = rt.build_command(cfg, caps)
+        if cfg["lan"]:
+            firewall = fw.ensure_firewall(cfg["port"])
+            self.add_log(f"LAN firewall {firewall}: TCP {cfg['port']} / LocalSubnet")
         rt.root().mkdir(parents=True, exist_ok=True)
         self.server_log.write_text("Inkling Mini llama-server started " + time.ctime() +
                                    "\nArguments: " + subprocess.list2cmdline(cmd) + "\n",
