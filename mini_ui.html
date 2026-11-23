@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inkling Mini DSpark Manager</title>
+<style>
+:root{color-scheme:dark;font-family:"Segoe UI",Arial,sans-serif;background:#0b1020;color:#e8edf7}*{box-sizing:border-box}body{margin:0;line-height:1.5}header{background:#131c30;border-bottom:1px solid #27354a;padding:18px max(20px,calc((100% - 1150px)/2))}h1{font-size:25px;margin:0}h2{font-size:19px;margin:0 0 12px}header p,.hint{color:#a4b5ce;margin:5px 0}.wrap{max-width:1150px;margin:22px auto;padding:0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px}.card{background:#151f34;border:1px solid #304057;border-radius:12px;padding:20px;margin:0 0 18px;min-width:0}.steps{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:18px}button{border:0;border-radius:7px;background:#3c77ee;color:white;padding:11px 16px;cursor:pointer;font-size:14px;font-weight:600}button:hover{background:#558cff}button:disabled{opacity:.4;cursor:not-allowed}.secondary{background:#34425b}.danger{background:#b04854}.ok{color:#5de0ab}.warn{color:#f8cf80}.bad{color:#ff8888}.status{font-weight:700}label{display:block;font-size:13px;color:#b9cae0;margin:11px 0 5px}input,select{background:#091326;border:1px solid #40536c;color:#f0f4fa;padding:10px;border-radius:6px;width:100%;font-size:14px}input[type=checkbox]{width:auto;margin-right:8px}label.check{display:flex;align-items:center;font-size:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#091426;border:1px solid #273a56;border-radius:8px;padding:12px;max-height:340px;overflow:auto;font-size:12px}code{color:#93c5fd}strong{color:#fff}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:#0d172a;padding:13px;border-radius:7px}.metric b{font-size:22px;display:block}.metric small{color:#b6c7de}canvas{width:100%;height:170px;background:#0d172a;border-radius:8px}.note{border-left:3px solid #e3b65d;padding:8px 12px;color:#ebd8b2;background:#262439}.line{padding:7px 0;border-bottom:1px solid #26364b}.copy{font-weight:normal}.footer{color:#8d9eb5;text-align:center;font-size:12px;padding:25px}@media(max-width:560px){.grid{grid-template-columns:minmax(0,1fr)}.stats{grid-template-columns:1fr}}
+</style></head><body><header><h1>Inkling 2 Mini · H100 DSpark</h1><p>Windows Server x64 / Unsloth CUDA 13 newer / Q8 GGUF + Q8 DSpark + Vision · 단일 GPU</p></header>
+<main class="wrap">
+<div id="banner" class="card status">상태 확인 중…</div>
+<div class="steps"><button onclick="saveAndProbe()">① 엔진 확인</button><button onclick="download()">② 모델 받기 · SHA-256</button><button onclick="start()">③ 서버 시작</button><button class="secondary" onclick="test()">기능 검증</button><button class="danger" onclick="stop()">서버 중지</button></div>
+<div class="grid">
+<section class="card">
+<h2>서버 설정</h2><p class="hint">기존 Unsloth Windows x64 CUDA13 newer의 압축을 푼 폴더에서 <code>llama-server.exe</code>를 지정하세요. 재다운로드하지 않습니다.</p>
+<label>llama-server.exe 절대경로</label><input id="engine" placeholder="D:\llama-win-cuda13\llama-server.exe">
+<label>모델 폴더 (비우면 사용자 로컬 앱데이터)</label><input id="model_dir" placeholder="D:\Models\Inkling-2-Mini">
+<div class="grid" style="gap:10px;grid-template-columns:repeat(2,minmax(0,1fr))">
+<div><label>컨텍스트</label><select id="context"></select></div><div><label>GPU 인덱스</label><input id="gpu_index" type="number" min="0" max="15"></div>
+<div><label>동시 슬롯 수</label><input id="parallel" type="number" min="1" max="2"></div><div><label>API 포트</label><input id="port" type="number" min="1024" max="65535"></div>
+<div><label>DSpark draft tokens</label><input id="spec_tokens" type="number" min="1" max="7"></div><div><label>KV 캐시 정밀도</label><select id="kv"><option value="f16">FP16 (우선)</option><option value="q8_0">Q8_0</option></select></div>
+<div><label>Batch</label><input id="batch" type="number" min="128" max="8192"></div><div><label>Micro batch</label><input id="ubatch" type="number" min="32" max="2048"></div></div>
+<label class="check"><input type="checkbox" id="dspark">DSpark speculative decoding (우선 적용)</label>
+<label class="check"><input type="checkbox" id="vision">이미지 입력 활성화</label>
+<label class="check"><input type="checkbox" id="flash">Flash Attention</label>
+<label class="check"><input type="checkbox" id="metrics">서버 메트릭</label>
+<div class="actions"><button class="secondary" onclick="save()">설정 저장</button></div>
+<p class="note">1M은 이론상 모델 컨텍스트 상한이지만 H100 94GB에서 반드시 작동하는 보장이 없습니다. 32K부터 검증하고 늘리세요. 설정 변경은 서버 중지 후 적용됩니다.</p>
+</section>
+<section class="card">
+<h2>실시간 현황</h2>
+<div class="stats"><div class="metric"><small>Server</small><b id="health">—</b></div><div class="metric"><small>GPU 사용량</small><b id="vram">—</b></div><div class="metric"><small>Prefill (t/s)</small><b id="prefill">—</b></div><div class="metric"><small>Decode (t/s)</small><b id="decode">—</b></div></div>
+<h2 style="margin-top:20px">추이 · 선택 GPU VRAM (MiB)</h2><canvas id="chart" width="700" height="170"></canvas>
+<div class="line">작업: <span id="task">—</span></div><div class="line">다운로드: <span id="progress">—</span></div><div class="line">모델 검증: <span id="verified">—</span></div><div class="line">엔진 검사: <span id="features">—</span></div>
+<h2 style="margin-top:18px">검증 결과</h2><pre id="tests">실행 후 기능 검증을 누르세요.</pre>
+</section></div>
+<div class="grid">
+<section class="card"><h2>Claude Code 연결</h2><p>llama-server가 직접 Anthropic Messages API를 제공할 경우 로컬에 직접 연결합니다. 프록시는 사용하지 않습니다. 실제 Claude Code 통합은 Windows에서 확인해야 합니다.</p><pre id="claude"></pre><button class="secondary copy" onclick="copyClaude()">PowerShell 복사</button><p class="hint">엔진에 따라 <code>/v1/messages</code> 지원 여부가 다릅니다. 기능 검증의 Anthropic 항목을 확인하세요. 기존 Claude Code 로그인 환경에서 API 키/인증 설정 충돌이 있을 수 있습니다.</p></section>
+<section class="card"><h2>서버 로그</h2><pre id="serverlog">—</pre><h2>매니저 로그</h2><pre id="logs">—</pre></section>
+</div>
+</main><div class="footer">모든 관리 명령은 127.0.0.1:8766으로만 수신합니다. 공개 네트워크 노출용으로 설계되지 않았습니다.</div>
+<script>
+let initialized=false, latest=null, script="";
+const keys=['engine','model_dir','context','parallel','batch','ubatch','kv','spec_tokens','dspark','vision','flash','metrics','port','gpu_index'];
+const $=id=>document.getElementById(id);
+for (const n of [8192,32768,65536,131072,262144,524288,1048576]) {const opt=document.createElement('option');opt.value=n;opt.textContent=n===1048576?'1M (실험)':n>=1024?Math.round(n/1024)+'K':n;$('context').appendChild(opt)}
+function read(){const c={};for(const k of keys){let e=$(k);c[k]=e.type==='checkbox'?e.checked:e.type==='number'||['context','parallel','batch','ubatch','spec_tokens','port','gpu_index'].includes(k)?Number(e.value):e.value}return c}
+function fill(c){for(const k of keys){if(!(k in c))continue;const e=$(k);if(e.type==='checkbox')e.checked=c[k];else e.value=c[k]}}
+async function api(endpoint,data={}){let r=await fetch('/api/'+endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();if(!r.ok)throw Error(j.error||'요청 실패');return j}
+async function act(endpoint,data={}){try{await api(endpoint,data);await refresh()}catch(e){alert(e.message)}}
+async function save(){return act('save',read())}
+async function saveAndProbe(){try{await api('save',read());await api('probe');await refresh()}catch(e){alert(e.message)}}
+async function download(){await act('download')}
+async function start(){try{await api('save',read());await api('start');await refresh()}catch(e){alert(e.message)}}
+async function stop(){await act('stop')}
+async function test(){await act('test')}
+function safe(v){return v===undefined||v===null?'—':String(v)}
+function fmt(v){return typeof v==='number'?v.toLocaleString():safe(v)}
+function draw(history){const c=$('chart'),ctx=c.getContext('2d'),w=c.width,h=c.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#0d172a';ctx.fillRect(0,0,w,h);let pts=history.filter(v=>Number.isFinite(v.gpu_mb));if(pts.length<2)return;let max=Math.max(1024,...pts.map(v=>v.gpu_mb))*1.08;ctx.strokeStyle='#334865';ctx.beginPath();for(let i=1;i<4;i++){let y=i*h/4;ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();ctx.strokeStyle='#66c6f5';ctx.lineWidth=2.5;ctx.beginPath();pts.forEach((p,i)=>{let x=i*w/Math.max(1,pts.length-1),y=h-10-p.gpu_mb/max*(h-20);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();ctx.fillStyle='#b7cbe1';ctx.font='13px Segoe UI';ctx.fillText('peak '+Math.round(max/1.08)+' MiB',10,18)}
+function display(s){latest=s;if(!initialized){fill(s.config);initialized=true}const cfg=s.config;let text=s.health?'● Health OK':s.running?'● 모델 로딩 중':'● 서버 중지';$('banner').textContent=text+' · '+s.task.detail;$('banner').className='card status '+(s.health?'ok':s.running?'warn':'');$('health').textContent=s.health?'OK':s.running?'Loading':'Stopped';let gpu=(s.gpu.devices||[]).find(g=>g.index===cfg.gpu_index);$('vram').textContent=gpu?Math.round(gpu.total_mb-gpu.free_mb).toLocaleString()+' / '+Math.round(gpu.total_mb).toLocaleString()+' MiB':'—';$('prefill').textContent=fmt(s.metrics.prefill_tps);$('decode').textContent=fmt(s.metrics.decode_tps);$('task').textContent=s.task.state+' / '+s.task.detail;$('progress').textContent=(s.task.file||'—')+' · '+(s.task.stage||'')+' '+s.task.done+'/'+s.task.total;$('verified').textContent=s.verified?'3개 파일 검증됨':'검증 필요';$('features').textContent=s.features?'DSpark '+(s.features.dspark?'확인':'실패')+' / Flash '+(s.features.flash?'사용 가능':'불가'):'미검사';$('tests').textContent=JSON.stringify(s.tests,null,2);$('logs').textContent=s.logs.join('\n');$('serverlog').textContent=s.server_log.join('\n');draw(s.history||[]);script='$env:ANTHROPIC_BASE_URL="http://127.0.0.1:'+cfg.port+'"\n$env:ANTHROPIC_AUTH_TOKEN="local-inkling"\n$env:ANTHROPIC_API_KEY=""\nclaude --model inkling-mini';$('claude').textContent=script}
+async function copyClaude(){try{await navigator.clipboard.writeText(script);alert('복사 완료')}catch(e){alert('클립보드 복사 실패: '+e.message)}}
+async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('상태 조회 오류');display(await r.json())}catch(e){$('banner').textContent=e.message}}
+refresh();setInterval(refresh,2500);
+</script></body></html>
