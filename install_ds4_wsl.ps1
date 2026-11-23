@@ -26,14 +26,18 @@ if ! command -v git >/dev/null || ! command -v make >/dev/null || ! command -v c
   if [ "$SKIP_PKGS" = "1" ]; then echo "Missing tools; install git make cmake cargo CUDA toolkit"; exit 2; fi
   echo "Installing Ubuntu dependencies (sudo may prompt for password)"
   sudo apt-get update
-  sudo apt-get install -y git make cmake build-essential pkg-config libssl-dev clang curl
+  sudo apt-get install -y git make cmake build-essential pkg-config libssl-dev clang curl python3
 fi
 if ! command -v nvcc >/dev/null; then
   echo "CUDA nvcc missing in WSL. Install a supported Linux CUDA toolkit without replacing Windows driver."; exit 2
 fi
 if ! command -v cargo >/dev/null; then
-  echo "Rust/cargo missing. Install rustup for this WSL user per rustup.rs"; exit 2
+  echo "Installing official Rust toolchain bootstrap"
+  curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/ds4-rustup-init.sh
+  sh /tmp/ds4-rustup-init.sh -y --profile minimal
+  . "$HOME/.cargo/env"
 fi
+if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
 mkdir -p "$HOME/AI"
 cd "$HOME/AI"
 if [ ! -d ds4-dfm-rs/.git ]; then git clone https://github.com/Baekpica/ds4-dfm-rs.git; fi
@@ -52,7 +56,6 @@ echo "CAUTION: compilation and --help do not prove 2-GPU sharding, 1M context, D
 $env:DS4_SOURCE_REF = $SourceRef
 $env:DS4_SKIP_PKGS = $(if ($SkipPackages) { "1" } else { "0" })
 # Pass source via stdin to avoid Windows/WSL path translation.
-$script = $script.Replace('$SKIP_PKGS', '$SKIP_PKGS').Replace('$SOURCE_REF', '$SOURCE_REF')
 $script = "export SOURCE_REF='$SourceRef'; export SKIP_PKGS='$($env:DS4_SKIP_PKGS)';" + [Environment]::NewLine + $script
 $script | & wsl.exe -d $Distribution -- bash -s
 if ($LASTEXITCODE -ne 0) { throw "DS4 WSL installation/build failed (exit $LASTEXITCODE)" }
