@@ -264,7 +264,7 @@ strong{color:#8ed5ff}</style></head><body>
 <div class="panel"><h3>실행 설정</h3><select id="profile"></select>
 <button onclick="call('start')">시작</button><button onclick="call('check')">DS4 사전검사</button>
 <button onclick="call('stop')">정지</button><button onclick="call('probe')">API 검사</button>
-<button onclick="call('report')">진단 ZIP 생성</button>
+<button onclick="call('report')">진단 ZIP 생성</button><button onclick="runSweep()">전체 프로필 순차 시험</button><button onclick="sweepStatus()">자동 시험 결과</button>
 <p><small>환경 설정은 실행 전에 JSON에서 바꿀 수 있습니다. 모델/실행 파일 경로는 실제 경로여야 합니다.</small></p>
 <textarea id="config"></textarea><br><button onclick="save()">설정 저장 · 재검사</button></div>
 <div class="panel"><h3>벤치마크</h3><input id="tokens" type="number" value="256" min="16" max="2048">
@@ -283,6 +283,8 @@ await status()}catch(e){show({error:String(e)})}}
 async function status(){document.getElementById('status').textContent=JSON.stringify(await request('/api/status'),null,2)}
 async function call(op){try{let n=document.getElementById('profile').value;show(await request('/api/'+op,op==='start'||op==='check'?{profile:n}:{}));await status()}catch(e){show({error:String(e)})}}
 async function save(){try{show(await request('/api/config',JSON.parse(document.getElementById('config').value)));await refresh()}catch(e){show({error:String(e)})}}
+async function runSweep(){try{let raw=JSON.parse(document.getElementById('config').value);let names=Object.keys(raw.profiles);if(!confirm(names.length+'개 프로필을 순차 시험합니다. 기존 서버가 실행 중이면 중지하세요. 진행할까요?'))return;show(await request('/api/sweep',{profiles:names,output:Number(document.getElementById('tokens').value),prompt:document.getElementById('prompt').value}));}catch(e){show({error:String(e)})}}
+async function sweepStatus(){try{show(await request('/api/sweep-status'))}catch(e){show({error:String(e)})}}
 async function runBench(){try{show(await request('/api/benchmark',{prompt:document.getElementById('prompt').value,tokens:Number(document.getElementById('tokens').value)}));await status()}catch(e){show({error:String(e)})}}
 refresh();
 </script></body></html>"""
@@ -311,6 +313,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, HTML, "text/html")
             if self.path == "/api/config":
                 return self._send(200, config())
+            if self.path == "/api/sweep-status":
+                import experiment_sweep
+                return self._send(200, experiment_sweep.status())
             if self.path == "/api/status":
                 with LOCK:
                     current = dict(CURRENT)
@@ -323,6 +328,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            origin = self.headers.get("Origin")
+            if origin and origin not in (f"http://127.0.0.1:{self.server.server_port}", f"http://localhost:{self.server.server_port}"):
+                raise ValueError("Cross-origin requests forbidden")
+            if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+                raise ValueError("application/json required")
             data = self._body()
             if self.path == "/api/config":
                 save_config(data)
@@ -335,6 +345,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, stop())
             if self.path == "/api/probe":
                 return self._send(200, probe())
+            if self.path == "/api/sweep":
+                import experiment_sweep
+                return self._send(200, experiment_sweep.begin(data.get("profiles", []), data.get("prompt", "Explain PID control."), data.get("output", 256)))
             if self.path == "/api/benchmark":
                 return self._send(200, benchmark(data.get("prompt", "Hello"),
                                                  data.get("tokens", 256), data.get("image")))
