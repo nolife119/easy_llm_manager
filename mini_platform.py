@@ -318,10 +318,19 @@ class Manager:
                                      "llamacpp:prompt_seconds_total", self.metrics_prev)
                     decode = rt.rate(metrics, "llamacpp:tokens_predicted_total",
                                      "llamacpp:tokens_predicted_seconds_total", self.metrics_prev)
-                    self.metrics_prev = metrics
+                    drafted = metrics.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
+                    accepted = metrics.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
+                    before_drafted = self.metrics_prev.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
+                    before_accepted = self.metrics_prev.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
+                    d_drafted = max(0, drafted - before_drafted)
+                    d_accepted = max(0, accepted - before_accepted)
+                    acceptance = round(100 * d_accepted / d_drafted, 1) if d_drafted > 0 else None
                     self.last_metrics = {"prefill_tps": prompt, "decode_tps": decode,
+                                         "dspark_acceptance": acceptance,
+                                         "drafted": d_drafted, "accepted": d_accepted,
                                          "tokens": metrics.get("llamacpp:tokens_predicted_total"),
                                          "prompt_tokens": metrics.get("llamacpp:prompt_tokens_total")}
+                    self.metrics_prev = metrics
                 except (OSError, ValueError):
                     self.last_metrics = {"error": "metrics unavailable"}
             if running:
