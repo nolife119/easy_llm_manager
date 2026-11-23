@@ -89,6 +89,51 @@ class MiniRuntimeTests(unittest.TestCase):
         self.assertEqual(img[:8], b"\x89PNG\r\n\x1a\n")
         self.assertGreater(len(img), 30)
 
+
+    def test_huggingface_model_info_uses_supported_signature(self):
+        """Regression: HfApi.model_info does not accept repo_type."""
+        import hashlib
+        import sys
+        import types
+        from unittest.mock import Mock
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            blobs = {
+                name: b"GGUF" + name.encode("utf-8") * 20000
+                for name in r.FILES
+            }
+            metadata = {
+                name: SimpleNamespace(
+                    etag=hashlib.sha256(data).hexdigest(), size=len(data)
+                )
+                for name, data in blobs.items()
+            }
+            api = Mock()
+            api.model_info.return_value = SimpleNamespace(sha="test-revision")
+            hub = types.ModuleType("huggingface_hub")
+            hub.HfApi = lambda: api
+            hub.hf_hub_url = lambda repo_id, filename, revision: filename
+
+            def fake_download(repo_id, filename, revision, local_dir):
+                target = Path(local_dir) / filename
+                target.write_bytes(blobs[filename])
+                return str(target)
+
+            hub.hf_hub_download = fake_download
+            download_module = types.ModuleType("huggingface_hub.file_download")
+            download_module.get_hf_file_metadata = lambda url: metadata[url]
+            modules = {"huggingface_hub": hub, "huggingface_hub.file_download": download_module}
+            with patch.dict(sys.modules, modules), patch.object(r, "ensure_hub", return_value=hub):
+                cfg = r.validate({"model_dir": folder})
+                out = r.download_models(cfg, lambda message: None,
+                                        lambda *args: None)
+
+            api.model_info.assert_called_once_with(r.REPO)
+            self.assertEqual(out["revision"], "test-revision")
+            self.assertTrue(r.is_verified(cfg))
+
     def test_config_save_and_reload(self):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"INKLING_MINI_HOME": d}):
             cfg = r.validate({"context": 65536, "spec_tokens": 4})
