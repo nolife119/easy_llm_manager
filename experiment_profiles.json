@@ -1,0 +1,108 @@
+{
+  "schema": 1,
+  "notes": "Windows-only test profiles. Replace executable/model paths. VQ requires DS4 native port and model-parallel backend not provided here. Set only options supported by your engine --help.",
+  "profiles": {
+    "llama-32k-baseline": {
+      "backend": "llama",
+      "executable": "D:\\AI\\llama\\llama-server.exe",
+      "model": "D:\\AI\\models\\UD-IQ1_M\\model-00001-of-000XX.gguf",
+      "port": 8080,
+      "alias": "inkling-2-small",
+      "context_requested": 32768,
+      "args": [
+        "-m",
+        "{model}",
+        "-c",
+        "32768",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--alias",
+        "{alias}",
+        "-ngl",
+        "999",
+        "-np",
+        "1"
+      ],
+      "env": {}
+    },
+    "llama-128k-baseline": {
+      "backend": "llama",
+      "executable": "D:\\AI\\llama\\llama-server.exe",
+      "model": "D:\\AI\\models\\UD-IQ1_M\\model-00001-of-000XX.gguf",
+      "port": 8080,
+      "alias": "inkling-2-small",
+      "context_requested": 131072,
+      "args": [
+        "-m",
+        "{model}",
+        "-c",
+        "131072",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--alias",
+        "{alias}",
+        "-ngl",
+        "999",
+        "-np",
+        "1"
+      ],
+      "env": {}
+    },
+    "ds4-vq-32k-preflight": {
+      "backend": "ds4",
+      "executable": "D:\\AI\\ds4\\ds4-server.exe",
+      "model": "D:\\AI\\models\\Inkling-2-Small-VQ-GGUF",
+      "port": 8000,
+      "alias": "inkling-2-vq",
+      "context_requested": 32768,
+      "args": [
+        "--cuda",
+        "-m",
+        "{model}",
+        "-c",
+        "32768",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--model-id",
+        "{alias}",
+        "--mtp-mode",
+        "off",
+        "--no-update-check"
+      ],
+      "env": {}
+    },
+    "ds4-vq-1m-dspark3": {
+      "backend": "ds4",
+      "executable": "D:\\AI\\ds4\\ds4-server.exe",
+      "model": "D:\\AI\\models\\Inkling-2-Small-VQ-GGUF",
+      "port": 8000,
+      "alias": "inkling-2-vq",
+      "context_requested": 1048576,
+      "args": [
+        "--cuda",
+        "-m",
+        "{model}",
+        "-c",
+        "1048576",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--model-id",
+        "{alias}",
+        "--mtp-mode",
+        "on",
+        "--mtp-draft",
+        "3",
+        "--no-update-check"
+      ],
+      "env": {}
+    }
+  }
+}
