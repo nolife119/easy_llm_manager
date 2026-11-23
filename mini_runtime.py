@@ -221,7 +221,7 @@ def download_models(cfg, log, progress):
     hub = ensure_hub(log)
     from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
     from huggingface_hub.file_download import get_hf_file_metadata
-    info = HfApi().model_info(REPO, repo_type="model")
+    info = HfApi().model_info(REPO)
     revision = info.sha
     folder = model_dir(cfg)
     folder.mkdir(parents=True, exist_ok=True)
