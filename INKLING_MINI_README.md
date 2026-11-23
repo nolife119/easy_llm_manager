@@ -14,7 +14,7 @@
 | 컨텍스트 | 기본 32K, 8K~1M 실험적인 선택 가능 |
 | API | 엔진 원본 \`/v1/chat/completions\`, 지원 엔진의 \`/v1/messages\` |
 | 대시보드 | \`http://127.0.0.1:8766\` |
-| 추론 서버 | \`http://127.0.0.1:8080\` 기본, 별도 프록시 없음 |
+| 추론 서버 | \`http://서버IP:8080\` 기본, 별도 프록시 없음 |
 
 **중요:** 이 8-bit 모델은 원본 FP8 체크포인트와 동일한 파일이 아닙니다. GGUF UD-Q8_K_XL 양자화입니다. 원본 약 20GB 체크포인트의 텐서들은 혼합 NVFP4/MXFP8 형식이며, 단순히 FP8이라 부르는 것과 차이가 있습니다. Unsloth의 DSpark는 **드래프트/가속용 별도 작은 모델**이며 8-bit 본 모델을 대체하지 않습니다.
 
@@ -68,3 +68,21 @@ python -m unittest discover -s tests -p "test_mini*.py" -v
 \`\`\`
 
 GitHub Actions가 Windows와 Ubuntu에서 CPU-only 테스트, JS 문법 검사 수행. Windows H100 통합 검증은 별도입니다.
+
+
+## Windows 방화벽 자동 설정 및 LAN 접속
+
+`start-mini.bat` 실행 시 `mini_firewall.py`가 Windows 방화벽을 점검합니다. 
+LAN 설정(기본 켜짐)이면 `Inkling Mini LLM API (LocalSubnet)` 이름의 인바운드 규칙을 생성합니다.
+규칙은 **TCP 추론 포트(기본 8080)** 만 허용하고, **Domain/Private 네트워크 프로필**과
+**RemoteAddress=LocalSubnet**으로 범위를 제한합니다. 기존 규칙이 정확하면 재설정하지 않습니다.
+필요 시 **Windows UAC 관리자 권한 승인**을 요청하며, 거절되거나 생성·검증에 실패하면
+`start-mini.bat`가 LAN 서비스를 시작하지 않습니다. 서버 실행 시에도 현재 API 포트에 대한
+규칙을 확인하므로 포트를 변경한 경우에도 같은 확인 절차를 거칩니다.
+
+- 추론 API는 기본 `0.0.0.0:8080` 바인딩이며, 같은 서브넷의 다른 PC에서 `http://서버IP:8080`으로 사용합니다.
+- 웹 관리 대시보드 **8766은 계속 `127.0.0.1` 전용**이며 방화벽에서 열지 않습니다.
+- 대시보드 **LAN 연결 허용**을 끄면 추론 API도 `127.0.0.1` 전용으로 돌아갑니다.
+- **인증 미구현:** 기본 llama-server API는 별도 인증이 없으므로 신뢰할 수 있는 네트워크에서만 사용하세요. LocalSubnet 범위가 신뢰할 수 없는 공유망을 포함한다면 사용하지 마세요.
+- Domain/Private 프로필이 아니거나, 원격 PC가 다른 서브넷이거나, 조직 GPO에서 로컬 인바운드 규칙을 막으면 접속되지 않을 수 있습니다. 관리자 또는 네트워크팀 승인 정책이 우선합니다.
+- 다른 PC의 Claude Code 연결 시 `ANTHROPIC_BASE_URL=http://서버IP:8080`으로 변경합니다. 토큰 문자열은 이 설정만으로 API 인증이 활성화되는 것이 아닙니다.
