@@ -22,6 +22,7 @@ class MiniRuntimeTests(unittest.TestCase):
         self.assertEqual(cfg["parallel"], 1)
         self.assertTrue(cfg["dspark"])
         self.assertTrue(cfg["vision"])
+        self.assertTrue(cfg["lan"])
 
     def test_context_1m_is_opt_in(self):
         cfg = r.validate({"context": 1048576})
@@ -32,7 +33,7 @@ class MiniRuntimeTests(unittest.TestCase):
     def test_bad_parallel_and_unknown_keys(self):
         for patch_cfg in ({"parallel": 0}, {"parallel": 1024}, {"port": 8766},
                           {"gpu_index": -1}, {"context": "32768"}, {"extra": 1},
-                          {"dspark": "false"}, {"kv": "q4_0"}):
+                          {"dspark": "false"}, {"lan": "yes"}, {"kv": "q4_0"}):
             with self.subTest(patch_cfg=patch_cfg), self.assertRaises(ValueError):
                 r.validate(patch_cfg)
 
@@ -52,7 +53,7 @@ class MiniRuntimeTests(unittest.TestCase):
             self.assertIn("--mmproj", cmd)
             self.assertIn("--jinja", cmd)
             self.assertIn("--metrics", cmd)
-            self.assertIn("127.0.0.1", cmd)
+            self.assertIn("0.0.0.0", cmd)
             self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "3")
             self.assertEqual(cmd[cmd.index("--parallel") + 1], "1")
             self.assertEqual(cmd[cmd.index("--ctx-size") + 1], "32768")
@@ -67,6 +68,8 @@ class MiniRuntimeTests(unittest.TestCase):
                               "model_dir": str(root), "dspark": False})
             cmd = r.build_command(cfg, {"flash": True, "metrics": True, "kv": True})
             self.assertNotIn("--model-draft", cmd)
+            local_cmd = r.build_command({**cfg, "lan": False}, {"flash": True, "metrics": True, "kv": True})
+            self.assertIn("127.0.0.1", local_cmd)
 
     def test_missing_required_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -134,6 +137,42 @@ class MiniRuntimeTests(unittest.TestCase):
             api.model_info.assert_called_once_with(r.REPO)
             self.assertEqual(out["revision"], "test-revision")
             self.assertTrue(r.is_verified(cfg))
+
+
+    def test_firewall_rules_are_lan_only(self):
+        import mini_firewall as f
+        from types import SimpleNamespace
+        with patch.object(f.ctypes, "windll", create=True) as windll:
+            windll.shell32.IsUserAnAdmin.return_value = False
+            calls = []
+            def executor(script, elevated=False):
+                calls.append((script, elevated))
+                return SimpleNamespace(returncode=3 if len(calls) == 1 else 0,
+                                       stderr="", stdout="")
+            self.assertEqual(f.ensure_firewall(8080, executor), "created")
+        self.assertFalse(calls[0][1])
+        self.assertTrue(calls[1][1])
+        self.assertFalse(calls[2][1])
+        self.assertIn("-RemoteAddress LocalSubnet", calls[1][0])
+        self.assertIn("-Profile Domain,Private", calls[1][0])
+        self.assertIn("-LocalPort 8080", calls[1][0])
+        self.assertNotIn("8766", calls[1][0])
+
+    def test_firewall_declined_fails_closed(self):
+        import mini_firewall as f
+        from types import SimpleNamespace
+        with patch.object(f.ctypes, "windll", create=True) as windll:
+            windll.shell32.IsUserAnAdmin.return_value = False
+            def executor(script, elevated=False):
+                return SimpleNamespace(returncode=5, stderr="denied", stdout="")
+            with self.assertRaises(RuntimeError):
+                f.ensure_firewall(8080, executor)
+
+    def test_firewall_validates_ports(self):
+        import mini_firewall as f
+        for port in (8766, 0, 70000, "8080"):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                f.ensure_firewall(port, lambda *_args, **_kw: None)
 
     def test_config_save_and_reload(self):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"INKLING_MINI_HOME": d}):
