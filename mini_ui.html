@@ -12,7 +12,7 @@
 <label>llama-server.exe 절대경로</label><input id="engine" placeholder="D:\llama-win-cuda13\llama-server.exe">
 <label>모델 폴더 (비우면 사용자 로컬 앱데이터)</label><input id="model_dir" placeholder="D:\Models\Inkling-2-Mini">
 <div class="grid" style="gap:10px;grid-template-columns:repeat(2,minmax(0,1fr))">
-<div><label>컨텍스트</label><select id="context"></select></div><div><label>GPU 인덱스</label><input id="gpu_index" type="number" min="0" max="15"></div>
+<div><label>컨텍스트</label><select id="context"></select></div><div><label>GPU 인덱스</label><input id="gpu_index" type="number" min="0" max="15"></div><div><label>GPU layers</label><input id="gpu_layers" type="number" min="1" max="999"></div>
 <div><label>동시 슬롯 수</label><input id="parallel" type="number" min="1" max="2"></div><div><label>API 포트</label><input id="port" type="number" min="1024" max="65535"></div>
 <div><label>DSpark draft tokens</label><input id="spec_tokens" type="number" min="1" max="7"></div><div><label>KV 캐시 정밀도</label><select id="kv"><option value="f16">FP16 (우선)</option><option value="q8_0">Q8_0</option></select></div>
 <div><label>Batch</label><input id="batch" type="number" min="128" max="8192"></div><div><label>Micro batch</label><input id="ubatch" type="number" min="32" max="2048"></div></div>
@@ -37,10 +37,10 @@
 </main><div class="footer">모든 관리 명령은 127.0.0.1:8766으로만 수신합니다. 공개 네트워크 노출용으로 설계되지 않았습니다.</div>
 <script>
 let initialized=false, latest=null, script="";
-const keys=['engine','model_dir','context','parallel','batch','ubatch','kv','spec_tokens','dspark','vision','flash','metrics','port','gpu_index'];
+const keys=['engine','model_dir','context','parallel','batch','ubatch','kv','spec_tokens','dspark','vision','flash','metrics','port','gpu_index','gpu_layers'];
 const $=id=>document.getElementById(id);
 for (const n of [8192,32768,65536,131072,262144,524288,1048576]) {const opt=document.createElement('option');opt.value=n;opt.textContent=n===1048576?'1M (실험)':n>=1024?Math.round(n/1024)+'K':n;$('context').appendChild(opt)}
-function read(){const c={};for(const k of keys){let e=$(k);c[k]=e.type==='checkbox'?e.checked:e.type==='number'||['context','parallel','batch','ubatch','spec_tokens','port','gpu_index'].includes(k)?Number(e.value):e.value}return c}
+function read(){const c={};for(const k of keys){let e=$(k);c[k]=e.type==='checkbox'?e.checked:e.type==='number'||['context','parallel','batch','ubatch','spec_tokens','port','gpu_index','gpu_layers'].includes(k)?Number(e.value):e.value}return c}
 function fill(c){for(const k of keys){if(!(k in c))continue;const e=$(k);if(e.type==='checkbox')e.checked=c[k];else e.value=c[k]}}
 async function api(endpoint,data={}){let r=await fetch('/api/'+endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();if(!r.ok)throw Error(j.error||'요청 실패');return j}
 async function act(endpoint,data={}){try{await api(endpoint,data);await refresh()}catch(e){alert(e.message)}}
