@@ -267,8 +267,9 @@ def download_models(cfg, log, progress):
         if result != expected_hash:
             actual.unlink(missing_ok=True)
             raise RuntimeError(filename + " SHA-256 불일치. 파일을 제거했습니다.")
-        if actual.read_bytes()[:4] != b"GGUF":  # Do not actually read the entire huge model.
-            raise RuntimeError(filename + " 파일이 GGUF가 아닙니다")
+        with actual.open("rb") as header:
+            if header.read(4) != b"GGUF":
+                raise RuntimeError(filename + " 파일이 GGUF가 아닙니다")
         stat = actual.stat()
         manifest[filename] = {"sha256": result, "size": stat.st_size,
                               "mtime_ns": stat.st_mtime_ns, "revision": revision}
