@@ -1,0 +1,29 @@
+name: Inkling Mini offline tests
+on:
+  push:
+    branches: [feature/inkling2-mini-fp8]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m py_compile mini_runtime.py mini_platform.py
+      - name: Offline unit tests
+        run: python -m unittest discover -s tests -p "test_mini*.py" -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check dashboard JavaScript
+        shell: bash
+        run: node -e "const s=require('fs').readFileSync('mini_ui.html','utf8'); new Function(s.split('<script>')[1].split('</script>')[0]); console.log('mini UI syntax OK')"
