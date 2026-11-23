@@ -26,7 +26,7 @@ DEFAULTS = {
     "engine": "", "model_dir": "", "context": 32768, "parallel": 1,
     "batch": 2048, "ubatch": 512, "kv": "f16", "spec_tokens": 3,
     "dspark": True, "vision": True, "flash": True, "metrics": True,
-    "port": 8080, "gpu_index": 0, "gpu_layers": 99
+    "port": 8080, "gpu_index": 0, "gpu_layers": 99, "lan": True
 }
 
 
@@ -70,7 +70,7 @@ def validate(data):
         raise ValueError("8766은 매니저 포트입니다")
     if cfg["kv"] not in ("f16", "q8_0"):
         raise ValueError("KV 캐시는 f16 또는 q8_0")
-    for key in ("dspark", "vision", "flash", "metrics"):
+    for key in ("dspark", "vision", "flash", "metrics", "lan"):
         if type(cfg[key]) is not bool:
             raise ValueError(key + "은 true/false")
     return cfg
@@ -171,7 +171,7 @@ def build_command(cfg, capabilities=None):
             raise ValueError("모델 파일 없음: " + str(p))
     caps = capabilities if capabilities is not None else probe_engine(str(ex))
     cmd = [str(ex.resolve()), "--model", str((folder / MODEL).resolve()),
-           "--host", "127.0.0.1", "--port", str(cfg["port"]),
+           "--host", "0.0.0.0" if cfg["lan"] else "127.0.0.1", "--port", str(cfg["port"]),
            "--ctx-size", str(cfg["context"]), "--parallel", str(cfg["parallel"]),
            "--n-gpu-layers", str(cfg["gpu_layers"]),
            "--batch-size", str(cfg["batch"]), "--ubatch-size", str(cfg["ubatch"]),
