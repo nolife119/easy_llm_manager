@@ -1,0 +1,9 @@
+{
+  "ds4_exe": "D:\\AI\\ds4\\ds4-server.exe",
+  "model_dir": "D:\\AI\\models\\Inkling-2-Small-VQ-GGUF",
+  "context": 1048576,
+  "mtp_draft": 3,
+  "port": 8000,
+  "mem_floor_gb": 4,
+  "acknowledge_unverified_multi_gpu": false
+}
