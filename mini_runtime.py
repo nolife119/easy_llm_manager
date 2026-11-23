@@ -145,7 +145,7 @@ def probe_engine(path):
         raise ValueError("엔진을 실행할 수 없습니다: " + str(exc)) from exc
     help_text = (proc.stdout + "\n" + proc.stderr).lower()
     required = ("--model-draft", "--spec-type", "--spec-draft-n-max",
-                "--n-gpu-layers-draft", "--mmproj", "--jinja")
+                "--n-gpu-layers-draft", "--mmproj", "--jinja", "--alias")
     missing = [x for x in required if x not in help_text]
     if missing:
         raise ValueError("이 llama-server는 필요한 Inkling DSpark 옵션이 없습니다: " +
@@ -175,7 +175,7 @@ def build_command(cfg, capabilities=None):
            "--ctx-size", str(cfg["context"]), "--parallel", str(cfg["parallel"]),
            "--n-gpu-layers", str(cfg["gpu_layers"]),
            "--batch-size", str(cfg["batch"]), "--ubatch-size", str(cfg["ubatch"]),
-           "--jinja", "--temp", "1", "--top-p", "1", "--top-k", "0",
+           "--jinja", "--alias", "inkling-mini", "--temp", "1", "--top-p", "1", "--top-k", "0",
            "--min-p", "0"]
     if cfg["vision"]:
         cmd += ["--mmproj", str((folder / PROJECTOR).resolve())]
