@@ -125,7 +125,8 @@ class MiniRuntimeTests(unittest.TestCase):
             download_module = types.ModuleType("huggingface_hub.file_download")
             download_module.get_hf_file_metadata = lambda url: metadata[url]
             modules = {"huggingface_hub": hub, "huggingface_hub.file_download": download_module}
-            with patch.dict(sys.modules, modules), patch.object(r, "ensure_hub", return_value=hub):
+            with patch.dict(sys.modules, modules), patch.object(r, "ensure_hub", return_value=hub), \
+                    patch.object(r, "EXPECTED_GB", (0.001, 0.001, 0.001)):
                 cfg = r.validate({"model_dir": folder})
                 out = r.download_models(cfg, lambda message: None,
                                         lambda *args: None)
