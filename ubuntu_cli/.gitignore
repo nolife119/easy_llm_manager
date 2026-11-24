@@ -1,0 +1,8 @@
+/config.json
+/env.sh
+/state/
+/runtime/
+/models/
+/archives/
+*.tar.gz
+__pycache__/
