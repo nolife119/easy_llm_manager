@@ -35,3 +35,15 @@ Each run saves config, command, engine probes, server.log and result under state
 
 ## Recovery
 Check server.log for missing shared libraries, unsupported SM80 kernels, OOM or unsupported GGUF architecture. For OOM reduce context/ubatch. If q8 KV fails, use safe preset. If DSpark fails disable it. Do not override security policy or disable TLS checks.
+
+## Local model selection and configuration
+
+```sh
+python llm.py models
+python llm.py select 1
+python llm.py set context 512K
+python llm.py set cache_k q8_0
+python llm.py set cache_v q4_0
+python llm.py run
+```
+Local models need not be downloaded through this manager. Discovery searches model_dir, adjacent models, ~/models, ~/AI/models, HF cache, and scan_dirs. Only GGUF magic/minimum header and shard presence are checked; these are not cryptographic verification. Select resets vision/dspark to avoid mismatched companions. Enable them explicitly and set projector_path/draft_path if ambiguous. Use smoke before production. A unique local model can be selected automatically if the configured default is absent. If multiple candidates exist, select explicitly. Run targets model_path when set; clear via python llm.py set model_path "" to return to the download default. Download settings are independent: for other repos set repo, revision, download_files (JSON list of exact relative GGUF names, all shards in order), download_projector and download_draft as needed. Download --all requires both companion filenames for custom downloads. Set scan_dirs to a JSON array of additional approved local directories. Use exact paths for manually selected models. Preset max-context attempts 1M with Q4/Q4, text only; it does not estimate or guarantee fitting VRAM. KV cache flags are passed to engine; unsupported types fail at startup. No GPU or end-to-end execution tests performed.
