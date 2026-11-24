@@ -117,15 +117,16 @@ def command(c):
     opts={"--model":str(root/fs[0]),"--ctx-size":c["context"],"--parallel":c["parallel"],"--n-gpu-layers":c["gpu_layers"],"--cache-type-k":c["cache_k"],"--cache-type-v":c["cache_v"],"--batch-size":c["batch"],"--ubatch-size":c["ubatch"],"--threads":c["threads"],"--flash-attn":"on","--host":c["host"],"--port":c["port"],"--alias":c["alias"],"--temp":1.0,"--top-p":1.0,"--top-k":0,"--min-p":0.0}
     if c["vision"]: opts["--mmproj"]=str(root/fs[1])
     if c["dspark"]: opts.update({"--model-draft":str(root/fs[-1]),"--spec-type":"draft-dspark","--spec-draft-n-max":c["draft_tokens"],"--n-gpu-layers-draft":99})
-    if c["host"] not in ("127.0.0.1","localhost","::1"): fail("Use approved port forwarding; default CLI only binds loopback")
+    if c["host"] not in ("127.0.0.1","localhost"): fail("Use approved port forwarding; default CLI only binds loopback")
     helptext=probe(c,"--help")
     flags=list(opts)+["--jinja","--metrics"]
+    if not c["vision"] and "--no-mmproj" in helptext: flags.append("--no-mmproj")
     for flag in flags:
         if not re.search(r"(?<![\w-])"+re.escape(flag)+r"(?![\w-])",helptext): fail("Engine missing option "+flag)
     if c["dspark"] and "draft-dspark" not in helptext: fail("Engine does not advertise DSpark")
     extra=c["extra_args"]
     if not isinstance(extra,list) or not all(isinstance(x,str) for x in extra): fail("extra_args must be a list of strings")
-    return [str(engine(c))]+[str(x) for pair in opts.items() for x in pair]+["--jinja","--metrics"]+extra
+    return [str(engine(c))]+[str(x) for pair in opts.items() for x in pair]+["--jinja","--metrics"]+(["--no-mmproj"] if "--no-mmproj" in flags else [])+extra
 def now(): return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 def request(c,route,data=None,timeout=300):
     url="http://127.0.0.1:"+str(c["port"])+route
@@ -152,7 +153,7 @@ def run(c,smoke=False):
                 except Exception: pass
                 time.sleep(2)
             if not ready: fail("Health check failed; see "+str(d/"server.log"))
-            save(STATE/"last-ready.json",c)
+            if not smoke: save(STATE/"last-ready.json",c)
             save(STATE/"active.json",{"run":str(d),"pid":p.pid})
             print("Health OK. Ctrl+C stops server. tail -f",d/"server.log",flush=True)
             if smoke:
@@ -202,9 +203,12 @@ def main():
     elif a.action in ("run","smoke"): run(c,a.action=="smoke")
     elif a.action=="bench": bench(c,int(a.value or 128))
     elif a.action=="save": save(preset(a.value or fail("Name required")),c)
-    elif a.action=="load": save(CONFIG,read(preset(a.value or fail("Name required"))))
+    elif a.action=="load":
+        name=a.value or fail("Name required")
+        builtins={"safe": {"context":8192,"cache_k":"f16","cache_v":"f16","vision":False,"dspark":False,"batch":512,"ubatch":128}, "128k":{"context":131072,"cache_k":"q8_0","cache_v":"q8_0","vision":False,"dspark":False,"batch":2048,"ubatch":512},"512k":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":False,"batch":2048,"ubatch":512},"512k-dspark":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":True,"batch":2048,"ubatch":512}}
+        save(CONFIG,{**c,**builtins[name]} if name in builtins else read(preset(name)))
     elif a.action=="restore": save(CONFIG,read(STATE/"last-ready.json"))
-    elif a.action=="presets": print("\n".join(x.stem for x in sorted((STATE/"presets").glob("*.json"))))
+    elif a.action=="presets": print("Built-in: safe, 128k, 512k, 512k-dspark\n"+"\n".join(x.stem for x in sorted((STATE/"presets").glob("*.json"))))
     elif a.action=="history": print("\n".join(str(x) for x in sorted((STATE/"runs").glob("*"))))
     elif a.action in ("show","init"): print(json.dumps(c,indent=2))
     return 0
