@@ -6,6 +6,7 @@ ROOT=Path(__file__).resolve().parent
 STATE=ROOT/"state"
 CONFIG=ROOT/"config.json"
 DEFAULT={"engine":"","archive":"","model_dir":"models","repo":"unsloth/Inkling-2-Mini-GGUF","revision":"main","layout":"unsloth","quant":"UD-Q4_K_XL","vision":False,"dspark":False,"context":8192,"parallel":1,"gpu_layers":99,"cache_k":"f16","cache_v":"f16","batch":512,"ubatch":128,"threads":26,"draft_tokens":2,"host":"127.0.0.1","port":8888,"alias":"inkling-2-mini","extra_args":[]}
+DEFAULT.update({"model_path":"","projector_path":"","draft_path":"","scan_dirs":[],"download_files":[],"download_projector":"","download_draft":""})
 def save(p,d):
     p.parent.mkdir(parents=True,exist_ok=True)
     t=p.with_suffix(p.suffix+".tmp"); t.write_text(json.dumps(d,indent=2,ensure_ascii=False)+"\n"); t.replace(p)
@@ -64,6 +65,8 @@ def setup(c,archive=None):
     (ROOT/"env.sh").write_text("export PATH="+shlex.quote(str(xs[0].parent))+':"$PATH"\nexport LD_LIBRARY_PATH='+shlex.quote(":".join([str(xs[0].parent),str(xs[0].parent/"lib"),str(xs[0].parent.parent/"lib")]))+':"${LD_LIBRARY_PATH:-}"\n')
     print("Saved engine path; optional: . ./env.sh")
 def files(c,all_assets=False):
+    if c["download_files"]:
+        return c["download_files"]+([c["download_projector"]] if (c["vision"] or all_assets) and c["download_projector"] else [])+([c["download_draft"]] if (c["dspark"] or all_assets) and c["download_draft"] else [])
     prefix="Mainline_Support/" if c["layout"]=="mainline" else ""
     if c["layout"] not in ("mainline","unsloth"): fail("Unknown layout")
     return [prefix+"Inkling-2-Mini-"+c["quant"]+".gguf"]+([prefix+"mmproj-F16.gguf"] if c["vision"] or all_assets else [])+([prefix+"dspark-Inkling-2-Mini-Q8_0.gguf"] if c["dspark"] or all_assets else [])
@@ -111,12 +114,88 @@ def download(c,all_assets=False):
                 if attempt==2: raise
                 time.sleep(3*(attempt+1))
     if not status(c,all_assets): fail("Download verification failed")
+def gguf_ok(p):
+    try:
+        with p.open("rb") as f:
+            return p.stat().st_size>=24 and f.read(4)==b"GGUF"
+    except OSError: return False
+def auxiliary(p):
+    n=p.name.lower()
+    return "mmproj" in n or "dspark" in n or "dflash" in n or "eagle3" in n or n.startswith("draft")
+def shards(p):
+    m=re.fullmatch(r"(.*)-(\d{5})-of-(\d{5})\.gguf",p.name,re.I)
+    if not m: return [p]
+    prefix,idx,total=m.groups()
+    if not 1<=int(total)<=1000 or idx!="00001": fail("Select first shard: "+str(p))
+    return [p.with_name(f"{prefix}-{i:05d}-of-{int(total):05d}.gguf") for i in range(1,int(total)+1)]
+def scan(c):
+    roots=[path(c["model_dir"]),ROOT.parent/"models",Path.home()/"models",Path.home()/"AI"/"models",Path(os.environ.get("HF_HUB_CACHE",str(Path(os.environ.get("HF_HOME",str(Path.home()/".cache/huggingface")))/"hub")))]
+    roots.extend(path(x) for x in c["scan_dirs"])
+    found={}
+    for root in roots:
+        if not root.is_dir(): continue
+        for p in root.rglob("*.gguf"):
+            if auxiliary(p): continue
+            try:
+                if all(gguf_ok(x) for x in shards(p)): found.setdefault(str(p.absolute()),p)
+            except RuntimeError: pass
+    return sorted(found.values(),key=lambda p:str(p))
+def list_models(c):
+    xs=scan(c)
+    for i,p in enumerate(xs,1):
+        print(f"{i:3d} {sum(x.stat().st_size for x in shards(p))/1e9:7.2f} GB  {p}")
+    if not xs: print("No local GGUF found; add scan_dirs or download.")
+    return xs
+def select_model(c,value):
+    if not value or value.isdecimal():
+        xs=list_models(c)
+        if not xs: fail("No model found")
+        n=int(value or input("Model number: "))
+        if not 1<=n<=len(xs): fail("Invalid model number")
+        p=xs[n-1]
+    else: p=path(value)
+    if auxiliary(p) or not all(gguf_ok(x) for x in shards(p)): fail("Invalid or incomplete model/shards")
+    c.update(model_path=str(p),projector_path="",draft_path="",vision=False,dspark=False,alias=p.stem)
+    save(CONFIG,c)
+    print("Selected",p)
+    print("Local header/shard check only; full integrity not verified. Run smoke.")
+def local_assets(c):
+    if c["model_path"]: p=path(c["model_path"])
+    else:
+        f=files(c)[0]; p=path(c["model_dir"])/f
+        if not gguf_ok(p):
+            xs=scan(c)
+            if len(xs)==1: p=xs[0]
+            elif len(xs)>1: fail("Multiple local models; run models then select NUMBER")
+    if auxiliary(p) or not all(gguf_ok(x) for x in shards(p)): fail("Missing or invalid GGUF/shards; download or select a model")
+    def asset(field,pattern):
+        if c[field]: q=path(c[field])
+        else:
+            xs=[x for x in p.parent.glob("*.gguf") if pattern in x.name.lower() and gguf_ok(x)]
+            if len(xs)!=1: fail("Set "+field+" explicitly; no unique companion in model directory")
+            q=xs[0]
+        if not gguf_ok(q): fail("Invalid companion "+str(q))
+        return q
+    return p,asset("projector_path","mmproj") if c["vision"] else None,asset("draft_path","dspark") if c["dspark"] else None
+def configure(c,key,value):
+    if key not in DEFAULT: fail("Unknown config key: "+key)
+    old=DEFAULT[key]
+    if isinstance(old,bool):
+        if value.lower() not in ("true","false","on","off"): fail("Use true/false")
+        value=value.lower() in ("true","on")
+    elif isinstance(old,int):
+        if key=="context" and re.fullmatch(r"\d+[kKmM]",value): value=int(value[:-1])*(1024 if value[-1].lower()=="k" else 1048576)
+        else: value=int(value)
+        if value<1 and key!="gpu_layers": fail("Expected positive integer")
+    elif isinstance(old,list): value=json.loads(value)
+    c[key]=value; save(CONFIG,c); print(key,"=",value)
+
 def command(c):
-    fs=files(c); root=path(c["model_dir"])
-    if not status(c): fail("Run download first")
-    opts={"--model":str(root/fs[0]),"--ctx-size":c["context"],"--parallel":c["parallel"],"--n-gpu-layers":c["gpu_layers"],"--cache-type-k":c["cache_k"],"--cache-type-v":c["cache_v"],"--batch-size":c["batch"],"--ubatch-size":c["ubatch"],"--threads":c["threads"],"--flash-attn":"on","--host":c["host"],"--port":c["port"],"--alias":c["alias"],"--temp":1.0,"--top-p":1.0,"--top-k":0,"--min-p":0.0}
-    if c["vision"]: opts["--mmproj"]=str(root/fs[1])
-    if c["dspark"]: opts.update({"--model-draft":str(root/fs[-1]),"--spec-type":"draft-dspark","--spec-draft-n-max":c["draft_tokens"],"--n-gpu-layers-draft":99})
+    model,projector,draft=local_assets(c)
+    print("Local GGUF:",model,"(header/shard check; use download/status for remote verification)")
+    opts={"--model":str(model),"--ctx-size":c["context"],"--parallel":c["parallel"],"--n-gpu-layers":c["gpu_layers"],"--cache-type-k":c["cache_k"],"--cache-type-v":c["cache_v"],"--batch-size":c["batch"],"--ubatch-size":c["ubatch"],"--threads":c["threads"],"--flash-attn":"on","--host":c["host"],"--port":c["port"],"--alias":c["alias"],"--temp":1.0,"--top-p":1.0,"--top-k":0,"--min-p":0.0}
+    if c["vision"]: opts["--mmproj"]=str(projector)
+    if c["dspark"]: opts.update({"--model-draft":str(draft),"--spec-type":"draft-dspark","--spec-draft-n-max":c["draft_tokens"],"--n-gpu-layers-draft":99})
     if c["host"] not in ("127.0.0.1","localhost"): fail("Use approved port forwarding; default CLI only binds loopback")
     helptext=probe(c,"--help")
     flags=list(opts)+["--jinja","--metrics"]
@@ -179,10 +258,10 @@ def preset(name):
     if not re.fullmatch(r"[A-Za-z0-9_-]+",name): fail("Invalid preset name")
     return STATE/"presets"/(name+".json")
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("action",nargs="?",default="menu",choices=["menu","setup","doctor","download","status","run","smoke","bench","save","load","restore","presets","history","show","init"]); p.add_argument("value",nargs="?"); p.add_argument("--all",action="store_true"); a=p.parse_args(); c=config()
+    p=argparse.ArgumentParser(); p.add_argument("action",nargs="?",default="menu",choices=["menu","setup","doctor","download","status","run","smoke","bench","save","load","restore","presets","history","show","init","models","select","set"]); p.add_argument("value",nargs="?"); p.add_argument("setting",nargs="?"); p.add_argument("--all",action="store_true"); a=p.parse_args(); c=config()
     if a.action=="menu":
         while True:
-            print("\n1 Setup  2 Doctor  3 Download all  4 Status  5 Smoke  6 Run  7 Save preset  8 Load preset  9 Restore last ready  0 Exit")
+            print("\n1 Setup  2 Doctor  3 Download all  4 Status  5 Smoke  6 Run  7 Save preset  8 Load preset  9 Restore last ready  10 Models/select  11 Set config  0 Exit")
             x=input("> ").strip()
             if x=="0": return
             try:
@@ -195,7 +274,12 @@ def main():
                 elif x=="7": save(preset(input("Name: ")),config())
                 elif x=="8": save(CONFIG,read(preset(input("Name: "))))
                 elif x=="9": save(CONFIG,read(STATE/"last-ready.json"))
+                elif x=="10": select_model(config(),None)
+                elif x=="11": configure(config(),input("Key: "),input("Value: "))
             except (Exception,KeyboardInterrupt) as e: print("Stopped:",e,file=sys.stderr)
+    elif a.action=="models": list_models(c)
+    elif a.action=="select": select_model(c,a.value)
+    elif a.action=="set": configure(c,a.value or fail("Key required"),a.setting or fail("Value required"))
     elif a.action=="setup": setup(c,a.value)
     elif a.action=="doctor": doctor(c)
     elif a.action=="download": download(c,a.all)
@@ -208,7 +292,7 @@ def main():
         builtins={"safe": {"context":8192,"cache_k":"f16","cache_v":"f16","vision":False,"dspark":False,"batch":512,"ubatch":128}, "128k":{"context":131072,"cache_k":"q8_0","cache_v":"q8_0","vision":False,"dspark":False,"batch":2048,"ubatch":512},"512k":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":False,"batch":2048,"ubatch":512},"512k-dspark":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":True,"batch":2048,"ubatch":512}}
         save(CONFIG,{**c,**builtins[name]} if name in builtins else read(preset(name)))
     elif a.action=="restore": save(CONFIG,read(STATE/"last-ready.json"))
-    elif a.action=="presets": print("Built-in: safe, 128k, 512k, 512k-dspark\n"+"\n".join(x.stem for x in sorted((STATE/"presets").glob("*.json"))))
+    elif a.action=="presets": print("Built-in: safe, 128k, 512k, 512k-dspark, max-context\n"+"\n".join(x.stem for x in sorted((STATE/"presets").glob("*.json"))))
     elif a.action=="history": print("\n".join(str(x) for x in sorted((STATE/"runs").glob("*"))))
     elif a.action in ("show","init"): print(json.dumps(c,indent=2))
     return 0
