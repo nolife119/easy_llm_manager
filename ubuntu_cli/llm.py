@@ -66,6 +66,8 @@ def setup(c,archive=None):
     print("Saved engine path; optional: . ./env.sh")
 def files(c,all_assets=False):
     if c["download_files"]:
+        if (c["vision"] or all_assets) and not c["download_projector"]: fail("Specify download_projector or disable vision/--all")
+        if (c["dspark"] or all_assets) and not c["download_draft"]: fail("Specify download_draft or disable dspark/--all")
         return c["download_files"]+([c["download_projector"]] if (c["vision"] or all_assets) and c["download_projector"] else [])+([c["download_draft"]] if (c["dspark"] or all_assets) and c["download_draft"] else [])
     prefix="Mainline_Support/" if c["layout"]=="mainline" else ""
     if c["layout"] not in ("mainline","unsloth"): fail("Unknown layout")
@@ -257,6 +259,10 @@ def bench(c,n):
 def preset(name):
     if not re.fullmatch(r"[A-Za-z0-9_-]+",name): fail("Invalid preset name")
     return STATE/"presets"/(name+".json")
+def load_preset(c,name):
+    builtins={"safe": {"context":8192,"cache_k":"f16","cache_v":"f16","vision":False,"dspark":False,"batch":512,"ubatch":128}, "128k":{"context":131072,"cache_k":"q8_0","cache_v":"q8_0","vision":False,"dspark":False,"batch":2048,"ubatch":512},"512k":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":False,"batch":2048,"ubatch":512},"512k-dspark":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":True,"batch":2048,"ubatch":512}}
+    save(CONFIG,{**c,**builtins[name]} if name in builtins else read(preset(name)))
+
 def main():
     p=argparse.ArgumentParser(); p.add_argument("action",nargs="?",default="menu",choices=["menu","setup","doctor","download","status","run","smoke","bench","save","load","restore","presets","history","show","init","models","select","set"]); p.add_argument("value",nargs="?"); p.add_argument("setting",nargs="?"); p.add_argument("--all",action="store_true"); a=p.parse_args(); c=config()
     if a.action=="menu":
@@ -272,14 +278,14 @@ def main():
                 elif x=="5": run(config(),True)
                 elif x=="6": run(config())
                 elif x=="7": save(preset(input("Name: ")),config())
-                elif x=="8": save(CONFIG,read(preset(input("Name: "))))
+                elif x=="8": load_preset(config(),input("Name: "))
                 elif x=="9": save(CONFIG,read(STATE/"last-ready.json"))
                 elif x=="10": select_model(config(),None)
                 elif x=="11": configure(config(),input("Key: "),input("Value: "))
             except (Exception,KeyboardInterrupt) as e: print("Stopped:",e,file=sys.stderr)
     elif a.action=="models": list_models(c)
     elif a.action=="select": select_model(c,a.value)
-    elif a.action=="set": configure(c,a.value or fail("Key required"),a.setting or fail("Value required"))
+    elif a.action=="set": configure(c,a.value or fail("Key required"),a.setting if a.setting is not None else fail("Value required"))
     elif a.action=="setup": setup(c,a.value)
     elif a.action=="doctor": doctor(c)
     elif a.action=="download": download(c,a.all)
@@ -289,8 +295,7 @@ def main():
     elif a.action=="save": save(preset(a.value or fail("Name required")),c)
     elif a.action=="load":
         name=a.value or fail("Name required")
-        builtins={"safe": {"context":8192,"cache_k":"f16","cache_v":"f16","vision":False,"dspark":False,"batch":512,"ubatch":128}, "128k":{"context":131072,"cache_k":"q8_0","cache_v":"q8_0","vision":False,"dspark":False,"batch":2048,"ubatch":512},"512k":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":False,"batch":2048,"ubatch":512},"512k-dspark":{"context":524288,"cache_k":"q8_0","cache_v":"q8_0","vision":True,"dspark":True,"batch":2048,"ubatch":512}}
-        save(CONFIG,{**c,**builtins[name]} if name in builtins else read(preset(name)))
+        load_preset(c,name)
     elif a.action=="restore": save(CONFIG,read(STATE/"last-ready.json"))
     elif a.action=="presets": print("Built-in: safe, 128k, 512k, 512k-dspark, max-context\n"+"\n".join(x.stem for x in sorted((STATE/"presets").glob("*.json"))))
     elif a.action=="history": print("\n".join(str(x) for x in sorted((STATE/"runs").glob("*"))))
